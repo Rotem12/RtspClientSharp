@@ -6,6 +6,11 @@ struct VideoDecoderContext
 	AVCodecContext *av_codec_context;
 	AVPacket av_raw_packet;
 	AVFrame *frame;
+	AVFrame *software_frame;
+	AVFrame *active_frame;
+	AVBufferRef *hw_device_ctx;
+	AVPixelFormat hw_pixel_format;
+	bool hardware_enabled;
 };
 
 struct ScalerContext
@@ -201,60 +206,110 @@ struct ScalerContext
 //	texture->Release();
 //}
 
-int create_video_decoder(int codec_id, void **handle)
+static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *pixel_formats)
 {
-//	printf("huh");
+	const auto context = static_cast<VideoDecoderContext *>(avctx->opaque);
+
+	if (context && context->hardware_enabled)
+	{
+		for (const AVPixelFormat *format = pixel_formats; *format != AV_PIX_FMT_NONE; format++)
+		{
+			if (*format == context->hw_pixel_format)
+				return *format;
+		}
+	}
+
+	return avcodec_default_get_format(avctx, pixel_formats);
+}
+
+static bool try_enable_d3d11va(VideoDecoderContext *context)
+{
+	context->hardware_enabled = false;
+	context->hw_pixel_format = AV_PIX_FMT_NONE;
+	av_buffer_unref(&context->hw_device_ctx);
+
+	for (int i = 0;; i++)
+	{
+		const AVCodecHWConfig *config = avcodec_get_hw_config(context->codec, i);
+
+		if (!config)
+			return false;
+
+		if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+			config->device_type == AV_HWDEVICE_TYPE_D3D11VA)
+		{
+			context->hw_pixel_format = config->pix_fmt;
+			break;
+		}
+	}
+
+	if (av_hwdevice_ctx_create(&context->hw_device_ctx, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) < 0)
+	{
+		context->hw_pixel_format = AV_PIX_FMT_NONE;
+		return false;
+	}
+
+	context->av_codec_context->hw_device_ctx = av_buffer_ref(context->hw_device_ctx);
+
+	if (!context->av_codec_context->hw_device_ctx)
+	{
+		av_buffer_unref(&context->hw_device_ctx);
+		context->hw_pixel_format = AV_PIX_FMT_NONE;
+		return false;
+	}
+
+	context->hardware_enabled = true;
+	return true;
+}
+
+static int open_decoder(VideoDecoderContext *context, bool preferHardware)
+{
+	context->av_codec_context->opaque = context;
+	context->av_codec_context->get_format = get_hw_format;
+
+	if (preferHardware && try_enable_d3d11va(context))
+	{
+		if (avcodec_open2(context->av_codec_context, context->codec, nullptr) == 0)
+			return 0;
+
+		avcodec_close(context->av_codec_context);
+		av_buffer_unref(&context->av_codec_context->hw_device_ctx);
+		av_buffer_unref(&context->hw_device_ctx);
+		context->hardware_enabled = false;
+		context->hw_pixel_format = AV_PIX_FMT_NONE;
+	}
+
+	context->av_codec_context->get_format = avcodec_default_get_format;
+	context->av_codec_context->opaque = nullptr;
+
+	return avcodec_open2(context->av_codec_context, context->codec, nullptr);
+}
+
+static void fallback_to_software_decoder(VideoDecoderContext *context)
+{
+	avcodec_close(context->av_codec_context);
+	av_buffer_unref(&context->av_codec_context->hw_device_ctx);
+	av_buffer_unref(&context->hw_device_ctx);
+	context->hardware_enabled = false;
+	context->hw_pixel_format = AV_PIX_FMT_NONE;
+	open_decoder(context, false);
+}
+
+int create_video_decoder_with_options(int codec_id, int preferHardwareAcceleration, void **handle)
+{
 	if (!handle)
 		return -1;
-
-//	av_log_set_level(AV_LOG_DEBUG);
 
 	auto context = static_cast<VideoDecoderContext *>(av_mallocz(sizeof(VideoDecoderContext)));
 
 	if (!context)
 		return -2;
 
-	//ID3D11Device* d3d11_device = nullptr;
-	//ID3D11DeviceContext* d3d11_device_context = nullptr;
-	//D3D_FEATURE_LEVEL feature_level;
-
-	//HRESULT hr = D3D11CreateDevice(
-	//	nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-	//	D3D11_SDK_VERSION, &d3d11_device, &feature_level, &d3d11_device_context);
-
-	//if (FAILED(hr))
-	//{
-	//	printf("1st fail");
-	//}
-
-
-	AVBufferRef* hw_device_ctx = nullptr;
-//	AVHWDeviceType hw_type = av_hwdevice_iterate_types(AV_HWDEVICE_TYPE_NONE);
-
-	//av_hwdevice_
-	const char* name = "d3d11va";
-	if (av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_D3D11VA, name, NULL, 0) < 0)
-	{
-		printf("2nd fail");
-	//	hw_type = av_hwdevice_iterate_types(hw_type);
-	//	remove_video_decoder(context);
-	//	return -7;
-	}
-
-
-//	std::cout << hw_type + "\n";
-
-	context->codec = avcodec_find_decoder_by_name("h264_d3d11va");
-   // context->codec = avcodec_find_decoder(static_cast<AVCodecID>(codec_id));
+	context->codec = avcodec_find_decoder(static_cast<AVCodecID>(codec_id));
 	if (!context->codec)
 	{
-		printf("failed to find d3d11 decoder");
-		context->codec = avcodec_find_decoder(static_cast<AVCodecID>(codec_id));
-		if (!context->codec)
-		{
-			remove_video_decoder(context);
-			return -3;
-		}
+		remove_video_decoder(context);
+		return -3;
 	}
 
 	context->av_codec_context = avcodec_alloc_context3(context->codec);
@@ -264,27 +319,11 @@ int create_video_decoder(int codec_id, void **handle)
 		return -4;
 	}
 
-	context->av_codec_context->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-
-//	if(!context->av_codec_context->hw_device_ctx)
-	{
-		printf("3rd fail");
-	}
-
-//	if (av_hwdevice_ctx_init(context->av_codec_context->hw_device_ctx) < 0)
-	{
-		printf("4th fail");
-	}
-
-
-	if (avcodec_open2(context->av_codec_context, context->codec, nullptr) < 0)
+	if (open_decoder(context, preferHardwareAcceleration != 0) < 0)
 	{
 		remove_video_decoder(context);
 		return -5;
 	}
-
-
-	printf("%d", context->av_codec_context->flags);
 
 	context->frame = av_frame_alloc();
 	if (!context->frame)
@@ -293,9 +332,14 @@ int create_video_decoder(int codec_id, void **handle)
 		return -6;
 	}
 
-	av_init_packet(&context->av_raw_packet);
+	context->software_frame = av_frame_alloc();
+	if (!context->software_frame)
+	{
+		remove_video_decoder(context);
+		return -7;
+	}
 
-	av_buffer_unref(&hw_device_ctx);
+	av_init_packet(&context->av_raw_packet);
 
 	*handle = context;
 
@@ -326,7 +370,8 @@ int set_video_decoder_extradata(void *handle, void *extradata, int extradataLeng
 	memset(context->av_codec_context->extradata + extradataLength, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 	
 	avcodec_close(context->av_codec_context);
-	if (avcodec_open2(context->av_codec_context, context->codec, nullptr) < 0)
+	av_buffer_unref(&context->av_codec_context->hw_device_ctx);
+	if (open_decoder(context, true) < 0)
 		return -3;
 
 	return 0;
@@ -344,45 +389,55 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 
 	auto context = static_cast<VideoDecoderContext *>(handle);
 
-	//printf("1");
+	av_frame_unref(context->frame);
+	av_frame_unref(context->software_frame);
+	context->active_frame = nullptr;
+
 	context->av_raw_packet.data = static_cast<uint8_t *>(rawBuffer);
 	context->av_raw_packet.size = rawBufferLength;
 
-//	int got_frame;
-
-	//const int len = avcodec_decode_video2(context->av_codec_context, context->frame, &got_frame, &context->av_raw_packet);
 	int len = avcodec_send_packet(context->av_codec_context, &context->av_raw_packet);
-	//printf("2");
-
-//	if (len != rawBufferLength)
-//		return -3;
 
 	if (len < 0)
 		return -3;
 
 	len = avcodec_receive_frame(context->av_codec_context, context->frame);
 
-	//printf("3");
-
 	if (len < 0)
 		return -4;
 
-	if (context->frame->hw_frames_ctx)
+	context->active_frame = context->frame;
+
+	if (context->frame->format == context->hw_pixel_format)
 	{
-//		printf("works");
-		return 0;
+		if (av_hwframe_transfer_data(context->software_frame, context->frame, 0) < 0)
+		{
+			fallback_to_software_decoder(context);
+			return -5;
+		}
+
+		context->active_frame = context->software_frame;
 	}
-	else
-//	if (got_frame)
-	{
-	//if(context->frame->format == AV_PIX_FMT_D3D11)
-		*frameWidth = context->av_codec_context->width;
-		*frameHeight = context->av_codec_context->height;
-		*framePixelFormat = context->av_codec_context->pix_fmt;
+
+	*frameWidth = context->active_frame->width;
+	*frameHeight = context->active_frame->height;
+	*framePixelFormat = context->active_frame->format;
+
+	return 0;
+}
+
+int create_video_decoder(int codec_id, void **handle)
+{
+	return create_video_decoder_with_options(codec_id, 1, handle);
+}
+
+int is_video_decoder_hardware_accelerated(void *handle)
+{
+	if (!handle)
 		return 0;
-	}
-	return -5;
-//	return -4;
+
+	const auto context = static_cast<VideoDecoderContext *>(handle);
+	return context->hardware_enabled ? 1 : 0;
 }
 
 int scale_decoded_video_frame(void *handle, void *scalerHandle, void *scaledBuffer, int scaledBufferStride)
@@ -394,6 +449,7 @@ int scale_decoded_video_frame(void *handle, void *scalerHandle, void *scaledBuff
 
 	auto context = static_cast<VideoDecoderContext *>(handle);
 	const auto scalerContext = static_cast<ScalerContext *>(scalerHandle);
+	AVFrame *sourceFrame = context->active_frame ? context->active_frame : context->frame;
 
 	//if (!scalerContext->hardware)
 	//{
@@ -410,13 +466,13 @@ int scale_decoded_video_frame(void *handle, void *scalerHandle, void *scaledBuff
 	if (!scaled_frame)
 		return -2;
 
-	scaled_frame->format = context->av_codec_context->pix_fmt;
+	scaled_frame->format = scalerContext->scaled_pixel_format;
 	scaled_frame->width = scalerContext->scaled_width;
 	scaled_frame->height = scalerContext->scaled_height;
 	scaled_frame->linesize[0] = scaledBufferStride;
 	scaled_frame->data[0] = (uint8_t *)scaledBuffer;
 
-	int ret = av_buffersrc_add_frame_flags(scalerContext->buffersrc_ctx, context->frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+	int ret = av_buffersrc_add_frame_flags(scalerContext->buffersrc_ctx, sourceFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
 	if (ret < 0)
 	{
 		av_frame_free(&scaled_frame);
@@ -478,11 +534,11 @@ void remove_video_decoder(void *handle)
 	
 	if (context->av_codec_context)
 	{
-		av_free(context->av_codec_context->extradata);
-		avcodec_close(context->av_codec_context);
-		av_free(context->av_codec_context);
+		avcodec_free_context(&context->av_codec_context);
 	}
 
+	av_buffer_unref(&context->hw_device_ctx);
+	av_frame_free(&context->software_frame);
 	av_frame_free(&context->frame);
 	av_free(context);
 }

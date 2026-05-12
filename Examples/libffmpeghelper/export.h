@@ -8,8 +8,10 @@
 
 //DllExport(int) set_window_hwnd(void* handle, void** contextHandle);
 DllExport(int) create_video_decoder(int codec_id, void **handle);
+DllExport(int) create_video_decoder_with_options(int codec_id, int preferHardwareAcceleration, void **handle);
 DllExport(int) set_video_decoder_extradata(void *handle, void *extradata, int extradataLength);
 DllExport(int) decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *frameWidth, int *frameHeight, int *framePixelFormat);
+DllExport(int) is_video_decoder_hardware_accelerated(void *handle);
 //DllExport(int) scale_decoded_video_frame(void *handle, void *scalerHandle, void *scaledBuffer, int scaledBufferStride, void* d3d11Handle);
 DllExport(int) scale_decoded_video_frame(void* handle, void* scalerHandle, void* scaledBuffer, int scaledBufferStride);
 DllExport(void) remove_video_decoder(void *handle);

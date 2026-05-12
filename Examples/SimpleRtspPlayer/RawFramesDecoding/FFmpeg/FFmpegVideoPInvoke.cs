@@ -41,6 +41,10 @@ namespace SimpleRtspPlayer.RawFramesDecoding.FFmpeg
         [DllImport(LibraryName, EntryPoint = "create_video_decoder", CallingConvention = CallingConvention.Cdecl)]
         public static extern int CreateVideoDecoder(FFmpegVideoCodecId videoCodecId, out IntPtr handle);
 
+        [DllImport(LibraryName, EntryPoint = "create_video_decoder_with_options", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int CreateVideoDecoderWithOptions(FFmpegVideoCodecId videoCodecId,
+            int preferHardwareAcceleration, out IntPtr handle);
+
         [DllImport(LibraryName, EntryPoint = "remove_video_decoder", CallingConvention = CallingConvention.Cdecl)]
         public static extern void RemoveVideoDecoder(IntPtr handle);
 
@@ -51,6 +55,9 @@ namespace SimpleRtspPlayer.RawFramesDecoding.FFmpeg
         [DllImport(LibraryName, EntryPoint = "decode_video_frame", CallingConvention = CallingConvention.Cdecl)]
         public static extern int DecodeFrame(IntPtr handle, IntPtr rawBuffer, int rawBufferLength, out int frameWidth,
             out int frameHeight, out FFmpegPixelFormat framePixelFormat);
+
+        [DllImport(LibraryName, EntryPoint = "is_video_decoder_hardware_accelerated", CallingConvention = CallingConvention.Cdecl)]
+        public static extern int IsVideoDecoderHardwareAccelerated(IntPtr handle);
 
         [DllImport(LibraryName, EntryPoint = "custom_alloc", CallingConvention = CallingConvention.Cdecl)]
         public static unsafe extern void* Malloc(int buffer_size);

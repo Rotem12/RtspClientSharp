@@ -19,6 +19,14 @@ struct AudioResamplerContext
 	AVSampleFormat out_sample_format;
 };
 
+static int64_t get_channel_layout(int channels, int64_t channel_layout)
+{
+	if (channel_layout != 0)
+		return channel_layout;
+
+	return av_get_default_channel_layout(channels);
+}
+
 int create_audio_decoder(int codec_id, int bits_per_coded_sample, void **handle)
 {
 	if (!handle)
@@ -47,7 +55,8 @@ int create_audio_decoder(int codec_id, int bits_per_coded_sample, void **handle)
 	if (codec_id == AV_CODEC_ID_PCM_MULAW || codec_id == AV_CODEC_ID_PCM_ALAW)
 	{
 		context->av_codec_context->sample_rate = 8000;
-		context->av_codec_context->ch_layout.nb_channels = 1;
+		context->av_codec_context->channels = 1;
+		context->av_codec_context->channel_layout = av_get_default_channel_layout(context->av_codec_context->channels);
 	}
 
 	context->av_codec_context->bits_per_coded_sample = bits_per_coded_sample;
@@ -126,7 +135,7 @@ int decode_audio_frame(void* handle, void* rawBuffer, int rawBufferLength, int* 
 
 	*sampleRate = context->av_codec_context->sample_rate;
 	*bitsPerSample = av_get_bytes_per_sample(context->av_codec_context->sample_fmt) * 8;
-	*channels = context->av_codec_context->ch_layout.nb_channels;
+	*channels = context->av_codec_context->channels;
 
 	return 0;
 }
@@ -141,7 +150,7 @@ int get_decoded_audio_frame(void *handle, void **outBuffer, int *outDataSize)
 	auto context = static_cast<AudioDecoderContext *>(handle);
 
 	*reinterpret_cast<uint8_t **>(outBuffer) = context->frame->data[0];
-	*outDataSize = av_samples_get_buffer_size(nullptr, context->av_codec_context->ch_layout.nb_channels, context->frame->nb_samples, context->av_codec_context->sample_fmt, 1);;
+	*outDataSize = av_samples_get_buffer_size(nullptr, context->av_codec_context->channels, context->frame->nb_samples, context->av_codec_context->sample_fmt, 1);;
 	return 0;
 }
 
@@ -191,18 +200,18 @@ int create_audio_resampler(void *decoderHandle, int outSampleRate, int outBitsPe
 		out_sample_format = decoder_context->av_codec_context->sample_fmt;
 
 	int out_channels;
-	AVChannelLayout out_channel_layout;
+	int64_t out_channel_layout;
 
 	if (outChannels != 0)
 	{
 		out_channels = outChannels;
-		av_channel_layout_default(&out_channel_layout, outChannels);
-		out_channel_layout = out_channel_layout;
+		out_channel_layout = av_get_default_channel_layout(outChannels);
 	}
 	else
 	{
-		out_channel_layout = decoder_context->av_codec_context->ch_layout;
-		out_channels = decoder_context->av_codec_context->ch_layout.nb_channels;
+		out_channel_layout = get_channel_layout(decoder_context->av_codec_context->channels,
+			decoder_context->av_codec_context->channel_layout);
+		out_channels = decoder_context->av_codec_context->channels;
 	}
 
 	const auto resampler_context = static_cast<AudioResamplerContext *>(av_mallocz(sizeof(AudioResamplerContext)));
@@ -210,20 +219,12 @@ int create_audio_resampler(void *decoderHandle, int outSampleRate, int outBitsPe
 	if (!resampler_context)
 		return -4;
 
-	AVChannelLayout in_channel_layout = decoder_context->av_codec_context->ch_layout;
+	int64_t in_channel_layout = get_channel_layout(decoder_context->av_codec_context->channels,
+		decoder_context->av_codec_context->channel_layout);
 
-	//resampler_context->swr_context = swr_alloc_set_opts(nullptr, out_channel_layout, out_sample_format, out_sample_rate, in_channel_layout, 
-	//	decoder_context->av_codec_context->sample_fmt, decoder_context->av_codec_context->sample_rate, 0, nullptr);
-
-	resampler_context->swr_context = swr_alloc();
-
-	av_opt_set_chlayout(resampler_context->swr_context, "in_channel_layout", &in_channel_layout, 0);
-	av_opt_set_int(resampler_context->swr_context, "in_sample_rate", decoder_context->av_codec_context->sample_rate, 0);
-	av_opt_set_sample_fmt(resampler_context->swr_context, "in_sample_fmt", decoder_context->av_codec_context->sample_fmt, 0);
-
-	av_opt_set_chlayout(resampler_context->swr_context, "out_channel_layout", &out_channel_layout, 0);
-	av_opt_set_int(resampler_context->swr_context, "out_sample_rate", out_sample_rate, 0);
-	av_opt_set_sample_fmt(resampler_context->swr_context, "out_sample_fmt", out_sample_format, 0);
+	resampler_context->swr_context = swr_alloc_set_opts(nullptr, out_channel_layout, out_sample_format,
+		out_sample_rate, in_channel_layout, decoder_context->av_codec_context->sample_fmt,
+		decoder_context->av_codec_context->sample_rate, 0, nullptr);
 	
 	if (resampler_context->swr_context == nullptr)
 	{

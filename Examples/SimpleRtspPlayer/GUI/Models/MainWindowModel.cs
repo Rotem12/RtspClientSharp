@@ -14,6 +14,16 @@ namespace SimpleRtspPlayer.GUI.Models
         public event EventHandler<string> StatusChanged;
 
         public IVideoSource VideoSource => _realtimeVideoSource;
+        public bool HardwareAccelerationEnabled
+        {
+            get => _realtimeVideoSource.HardwareAccelerationEnabled;
+            set => _realtimeVideoSource.HardwareAccelerationEnabled = value;
+        }
+
+        public MainWindowModel()
+        {
+            _realtimeVideoSource.DecoderStatusChanged += DecoderStatusChanged;
+        }
 
         public void Start(ConnectionParameters connectionParameters)
         {
@@ -40,6 +50,11 @@ namespace SimpleRtspPlayer.GUI.Models
         }
 
         private void ConnectionStatusChanged(object sender, string s)
+        {
+            StatusChanged?.Invoke(this, s);
+        }
+
+        private void DecoderStatusChanged(object sender, string s)
         {
             StatusChanged?.Invoke(this, s);
         }

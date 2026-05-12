@@ -8,6 +8,7 @@ namespace SimpleRtspPlayer.GUI.Models
         event EventHandler<string> StatusChanged;
 
         IVideoSource VideoSource { get; }
+        bool HardwareAccelerationEnabled { get; set; }
 
         void Start(ConnectionParameters connectionParameters);
         void Stop();

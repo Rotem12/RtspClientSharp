@@ -32,9 +32,10 @@ namespace SimpleRtspPlayer.RawFramesDecoding.FFmpeg
             Dispose();
         }
 
-        public static FFmpegVideoDecoder CreateDecoder(FFmpegVideoCodecId videoCodecId)
+        public static FFmpegVideoDecoder CreateDecoder(FFmpegVideoCodecId videoCodecId, bool preferHardwareAcceleration)
         {
-            int resultCode = FFmpegVideoPInvoke.CreateVideoDecoder(videoCodecId, out IntPtr decoderPtr);
+            int resultCode = FFmpegVideoPInvoke.CreateVideoDecoderWithOptions(videoCodecId,
+                preferHardwareAcceleration ? 1 : 0, out IntPtr decoderPtr);
 
             if (resultCode != 0)
                 throw new DecoderException(
@@ -42,6 +43,8 @@ namespace SimpleRtspPlayer.RawFramesDecoding.FFmpeg
 
             return new FFmpegVideoDecoder(videoCodecId, decoderPtr);
         }
+
+        public bool IsHardwareAccelerated => FFmpegVideoPInvoke.IsVideoDecoderHardwareAccelerated(_decoderHandle) != 0;
 
         public unsafe IDecodedVideoFrame TryDecode(RawVideoFrame rawVideoFrame)
         {

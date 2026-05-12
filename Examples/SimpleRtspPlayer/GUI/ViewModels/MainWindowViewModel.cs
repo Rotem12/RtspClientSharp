@@ -26,6 +26,15 @@ namespace SimpleRtspPlayer.GUI.ViewModels
         public string Password { get; set; } = "123456";
 
         public IVideoSource VideoSource => _mainWindowModel.VideoSource;
+        public bool HardwareAccelerationEnabled
+        {
+            get => _mainWindowModel.HardwareAccelerationEnabled;
+            set
+            {
+                _mainWindowModel.HardwareAccelerationEnabled = value;
+                OnPropertyChanged();
+            }
+        }
 
         public RelayCommand StartClickCommand { get; }
         public RelayCommand StopClickCommand { get; }
