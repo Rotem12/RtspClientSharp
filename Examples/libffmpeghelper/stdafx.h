@@ -23,6 +23,21 @@ extern "C"
 	#include <libswscale/swscale.h>
     #include <libavutil/samplefmt.h>
     #include <libswresample/swresample.h>
+	#include <libavfilter/avfilter.h>
+	#include <libavfilter/buffersrc.h>
+	#include <libavfilter/buffersink.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/mem.h>
+#include <libavutil/opt.h>
+#include <libavutil/frame.h>
+
+//#include <windows.h>
 }
+
+#include <d3d11.h>
+//#include <wrl/client.h>
+//#include <d2d1_1.h>
+//#include <d2d1.h>
+//#include <dxgi.h>
 
 #include "export.h"

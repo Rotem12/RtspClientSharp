@@ -34,7 +34,7 @@ namespace RtspClientSharp.MediaParsers
             if (codecInfo.SpsPpsBytes == null)
                 throw new ArgumentException($"{nameof(codecInfo.SpsPpsBytes)} is null", nameof(codecInfo));
 
-            _h264Parser = new H264Parser(() => GetFrameTimestamp(_timeOffset)) {FrameGenerated = OnFrameGenerated};
+            _h264Parser = new H264Parser(() => GetFrameTimestamp(_timeOffset)) { FrameGenerated = OnFrameGenerated };
 
             if (codecInfo.SpsPpsBytes.Length != 0)
                 _h264Parser.Parse(new ArraySegment<byte>(codecInfo.SpsPpsBytes), false);
@@ -48,11 +48,11 @@ namespace RtspClientSharp.MediaParsers
 
             if (!markerBit && timeOffset != _timeOffset)
                 _h264Parser.TryGenerateFrame();
-            
+
             _timeOffset = timeOffset;
 
-            PackModeType packMode = (PackModeType) (byteSegment.Array[byteSegment.Offset] & 0x1F);
-            
+            PackModeType packMode = (PackModeType)(byteSegment.Array[byteSegment.Offset] & 0x1F);
+
             switch (packMode)
             {
                 case PackModeType.FU_A:
@@ -100,7 +100,7 @@ namespace RtspClientSharp.MediaParsers
                 int type = (fuHeader & 0x1F) | (byteSegment.Array[byteSegment.Offset] & 0xE0);
 
                 offset += donFieldSize;
-                byteSegment.Array[offset] = (byte) type;
+                byteSegment.Array[offset] = (byte)type;
 
                 var nalUnitSegment = new ArraySegment<byte>(byteSegment.Array, offset,
                     byteSegment.Offset + byteSegment.Count - offset);
@@ -133,13 +133,14 @@ namespace RtspClientSharp.MediaParsers
             {
                 var nalUnitSegment = new ArraySegment<byte>(_nalStream.GetBuffer(), 0, (int)_nalStream.Position);
                 _nalStream.Position = 0;
+                _nalStream.SetLength(0);
                 _h264Parser.Parse(nalUnitSegment, markerBit);
                 _waitForStartFu = true;
             }
         }
 
         private void ParseSTAP(ArraySegment<byte> byteSegment, int donFieldSize,
-            bool markerBit)
+        bool markerBit)
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 

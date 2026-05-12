@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Net;
 using RtspClientSharp.Rtsp;
 
@@ -27,20 +28,25 @@ namespace RtspClientSharp
         public TimeSpan CancelTimeout { get; set; } = TimeSpan.FromSeconds(5);
         public string UserAgent { get; set; } = DefaultUserAgent;
         public RtpTransportProtocol RtpTransport { get; set; } = RtpTransportProtocol.TCP;
+        public Uri StreamUri { get; }
+        public bool UseTS { get; set; } = false;
+   //     public Codecs.Video.CodecInfoType Parser { get; set; } = Codecs.Video.CodecInfoType.H264;
 
-        public ConnectionParameters(Uri connectionUri)
+        public ConnectionParameters(Uri connectionUri, Uri streamUri = null)
         {
             ValidateUri(connectionUri);
 
             ConnectionUri = connectionUri;
+            StreamUri = streamUri;
             Credentials = GetNetworkCredentialsFromUri(connectionUri);
         }
 
-        public ConnectionParameters(Uri connectionUri, NetworkCredential credentials)
+        public ConnectionParameters(Uri connectionUri, NetworkCredential credentials, Uri streamUri = null)
         {
             ValidateUri(connectionUri);
 
             ConnectionUri = connectionUri;
+            StreamUri = streamUri;
             Credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         }
 

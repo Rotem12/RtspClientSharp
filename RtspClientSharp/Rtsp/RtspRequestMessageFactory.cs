@@ -54,6 +54,23 @@ namespace RtspClientSharp.Rtsp
             return rtspRequestMessage;
         }
 
+        public RtspRequestMessage CreateSetupUdpMulticastRequest(string trackName, string destination, int port)
+        {
+            Uri trackUri = GetTrackUri(trackName);
+
+            var rtspRequestMessage = new RtspRequestMessage(RtspMethod.SETUP, trackUri, ProtocolVersion,
+                NextCSeqProvider, _userAgent, SessionId);
+            if (destination == null)
+            {
+                rtspRequestMessage.Headers.Add("Transport", $"RTP/AVP;multicast");
+            }
+            else
+            {
+                rtspRequestMessage.Headers.Add("Transport", $"RTP/AVP;multicast;destination={destination};port={port}");
+            }
+            return rtspRequestMessage;
+        }
+
         public RtspRequestMessage CreatePlayRequest()
         {
             Uri uri = GetContentBasedUri();

@@ -1,0 +1,14 @@
+prefix=C:/msys64/home/matan71/ffmpeg32
+exec_prefix=${prefix}
+libdir=C:/msys64/home/matan71/ffmpeg32/lib
+includedir=C:/msys64/home/matan71/ffmpeg32/include
+
+Name: libavcodec
+Description: FFmpeg codec library
+Version: 61.33.100
+Requires: 
+Requires.private: libswresample >= 5.4.100, libavutil >= 59.56.100
+Conflicts:
+Libs: -L${libdir}  -lavcodec 
+Libs.private: -pthread -lm -latomic -llzma -lmfuuid -lole32 -lstrmiids -lole32 -luser32 -lz
+Cflags: -I${includedir}

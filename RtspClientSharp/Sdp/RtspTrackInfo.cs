@@ -7,6 +7,8 @@
         protected RtspTrackInfo(string trackName)
         {
             TrackName = trackName;
+            if (TrackName == null)
+                TrackName = "";
         }
     }
 }

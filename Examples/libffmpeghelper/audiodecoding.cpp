@@ -2,7 +2,7 @@
 
 struct AudioDecoderContext
 {
-	AVCodec *codec;
+	const AVCodec *codec;
 	AVCodecContext *av_codec_context;
 	AVPacket av_raw_packet;
 	AVFrame *frame;
@@ -47,7 +47,7 @@ int create_audio_decoder(int codec_id, int bits_per_coded_sample, void **handle)
 	if (codec_id == AV_CODEC_ID_PCM_MULAW || codec_id == AV_CODEC_ID_PCM_ALAW)
 	{
 		context->av_codec_context->sample_rate = 8000;
-		context->av_codec_context->channels = 1;
+		context->av_codec_context->ch_layout.nb_channels = 1;
 	}
 
 	context->av_codec_context->bits_per_coded_sample = bits_per_coded_sample;
@@ -100,7 +100,7 @@ int set_audio_decoder_extradata(void *handle, void *extradata, int extradataLeng
 	return 0;
 }
 
-int decode_audio_frame(void *handle, void *rawBuffer, int rawBufferLength, int *sampleRate, int *bitsPerSample, int *channels)
+int decode_audio_frame(void* handle, void* rawBuffer, int rawBufferLength, int* sampleRate, int* bitsPerSample, int* channels)
 {
 #if _DEBUG
 	if (!handle || !rawBuffer || !rawBufferLength || !sampleRate || !bitsPerSample || !channels)
@@ -110,28 +110,25 @@ int decode_audio_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 		return -2;
 #endif
 
-	auto context = static_cast<AudioDecoderContext *>(handle);
+	auto context = static_cast<AudioDecoderContext*>(handle);
 
-	context->av_raw_packet.data = static_cast<uint8_t *>(rawBuffer);
+	context->av_raw_packet.data = static_cast<uint8_t*>(rawBuffer);
 	context->av_raw_packet.size = rawBufferLength;
 
-	int got_frame;
-
-	const int len = avcodec_decode_audio4(context->av_codec_context, context->frame, &got_frame, &context->av_raw_packet);
-
-	if (len != rawBufferLength)
+	int ret = avcodec_send_packet(context->av_codec_context, &context->av_raw_packet);
+	if (ret < 0)
 		return -3;
 
-	if (got_frame)
-	{
-		*sampleRate = context->av_codec_context->sample_rate;
-		*bitsPerSample = av_get_bytes_per_sample(context->av_codec_context->sample_fmt) * 8;
-		*channels = context->av_codec_context->channels;
+	ret = avcodec_receive_frame(context->av_codec_context, context->frame);
+	if (ret < 0)
+		return -4;
 
-		return 0;
-	}
 
-	return -4;
+	*sampleRate = context->av_codec_context->sample_rate;
+	*bitsPerSample = av_get_bytes_per_sample(context->av_codec_context->sample_fmt) * 8;
+	*channels = context->av_codec_context->ch_layout.nb_channels;
+
+	return 0;
 }
 
 int get_decoded_audio_frame(void *handle, void **outBuffer, int *outDataSize)
@@ -144,7 +141,7 @@ int get_decoded_audio_frame(void *handle, void **outBuffer, int *outDataSize)
 	auto context = static_cast<AudioDecoderContext *>(handle);
 
 	*reinterpret_cast<uint8_t **>(outBuffer) = context->frame->data[0];
-	*outDataSize = av_samples_get_buffer_size(nullptr, context->av_codec_context->channels, context->frame->nb_samples, context->av_codec_context->sample_fmt, 1);;
+	*outDataSize = av_samples_get_buffer_size(nullptr, context->av_codec_context->ch_layout.nb_channels, context->frame->nb_samples, context->av_codec_context->sample_fmt, 1);;
 	return 0;
 }
 
@@ -157,8 +154,7 @@ void remove_audio_decoder(void *handle)
 
 	if (context->av_codec_context)
 	{
-		avcodec_close(context->av_codec_context);
-		av_free(context->av_codec_context);
+		avcodec_free_context(&context->av_codec_context);
 	}
 
 	av_frame_free(&context->frame);
@@ -195,17 +191,18 @@ int create_audio_resampler(void *decoderHandle, int outSampleRate, int outBitsPe
 		out_sample_format = decoder_context->av_codec_context->sample_fmt;
 
 	int out_channels;
-	int64_t out_channel_layout;
+	AVChannelLayout out_channel_layout;
 
 	if (outChannels != 0)
 	{
 		out_channels = outChannels;
-		out_channel_layout = av_get_default_channel_layout(outChannels);
+		av_channel_layout_default(&out_channel_layout, outChannels);
+		out_channel_layout = out_channel_layout;
 	}
 	else
 	{
-		out_channel_layout = decoder_context->av_codec_context->channel_layout;
-		out_channels = decoder_context->av_codec_context->channels;
+		out_channel_layout = decoder_context->av_codec_context->ch_layout;
+		out_channels = decoder_context->av_codec_context->ch_layout.nb_channels;
 	}
 
 	const auto resampler_context = static_cast<AudioResamplerContext *>(av_mallocz(sizeof(AudioResamplerContext)));
@@ -213,10 +210,20 @@ int create_audio_resampler(void *decoderHandle, int outSampleRate, int outBitsPe
 	if (!resampler_context)
 		return -4;
 
-	const int64_t in_channel_layout = decoder_context->av_codec_context->channel_layout;
+	AVChannelLayout in_channel_layout = decoder_context->av_codec_context->ch_layout;
 
-	resampler_context->swr_context = swr_alloc_set_opts(nullptr, out_channel_layout, out_sample_format, out_sample_rate, in_channel_layout, 
-		decoder_context->av_codec_context->sample_fmt, decoder_context->av_codec_context->sample_rate, 0, nullptr);
+	//resampler_context->swr_context = swr_alloc_set_opts(nullptr, out_channel_layout, out_sample_format, out_sample_rate, in_channel_layout, 
+	//	decoder_context->av_codec_context->sample_fmt, decoder_context->av_codec_context->sample_rate, 0, nullptr);
+
+	resampler_context->swr_context = swr_alloc();
+
+	av_opt_set_chlayout(resampler_context->swr_context, "in_channel_layout", &in_channel_layout, 0);
+	av_opt_set_int(resampler_context->swr_context, "in_sample_rate", decoder_context->av_codec_context->sample_rate, 0);
+	av_opt_set_sample_fmt(resampler_context->swr_context, "in_sample_fmt", decoder_context->av_codec_context->sample_fmt, 0);
+
+	av_opt_set_chlayout(resampler_context->swr_context, "out_channel_layout", &out_channel_layout, 0);
+	av_opt_set_int(resampler_context->swr_context, "out_sample_rate", out_sample_rate, 0);
+	av_opt_set_sample_fmt(resampler_context->swr_context, "out_sample_fmt", out_sample_format, 0);
 	
 	if (resampler_context->swr_context == nullptr)
 	{

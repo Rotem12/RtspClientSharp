@@ -19,7 +19,8 @@ namespace SimpleRtspPlayer.GUI.ViewModels
         private bool _startButtonEnabled = true;
         private bool _stopButtonEnabled;
 
-        public string DeviceAddress { get; set; } = "rtsp://184.72.239.149/vod/mp4:BigBuckBunny_115k.mov";
+            public string DeviceAddress { get; set; } = "rtsp://192.168.0.177/net0";
+     //   public string DeviceAddress { get; set; } = "rtsp://239.1.2.3:25000/mux1.sdp";
 
         public string Login { get; set; } = "admin";
         public string Password { get; set; } = "123456";
@@ -73,9 +74,11 @@ namespace SimpleRtspPlayer.GUI.ViewModels
 
             var connectionParameters = !string.IsNullOrEmpty(deviceUri.UserInfo) ? new ConnectionParameters(deviceUri) : 
                 new ConnectionParameters(deviceUri, credential);
-
-            connectionParameters.RtpTransport = RtpTransportProtocol.UDP;
+            
+            connectionParameters.RtpTransport = RtpTransportProtocol.TCP;
             connectionParameters.CancelTimeout = TimeSpan.FromSeconds(1);
+
+            connectionParameters.UseTS = true;
 
             _mainWindowModel.Start(connectionParameters);
             _mainWindowModel.StatusChanged += MainWindowModelOnStatusChanged;

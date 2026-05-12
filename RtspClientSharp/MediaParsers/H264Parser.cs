@@ -99,7 +99,7 @@ namespace RtspClientSharp.MediaParsers
         {
             _frameStream.Position = 0;
             _sliceType = -1;
-            _waitForIFrame = true;
+    //        _waitForIFrame = false;
         }
 
         private void SlicerOnNalUnitFound(ArraySegment<byte> byteSegment)

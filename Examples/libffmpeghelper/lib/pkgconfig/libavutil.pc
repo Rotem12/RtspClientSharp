@@ -1,0 +1,14 @@
+prefix=C:/msys64/home/matan71/ffmpeg32
+exec_prefix=${prefix}
+libdir=C:/msys64/home/matan71/ffmpeg32/lib
+includedir=C:/msys64/home/matan71/ffmpeg32/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 59.56.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil 
+Libs.private: -lm -luser32 -lbcrypt -latomic -pthread
+Cflags: -I${includedir}

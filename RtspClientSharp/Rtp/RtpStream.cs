@@ -51,7 +51,7 @@ namespace RtspClientSharp.Rtp
 
             if (!_isFirstPacket)
             {
-                int delta = (ushort) (rtpPacket.SeqNumber - _previousSeqNumber);
+                int delta = (ushort)(rtpPacket.SeqNumber - _previousSeqNumber);
 
                 if (delta != 1)
                 {
@@ -60,7 +60,7 @@ namespace RtspClientSharp.Rtp
                     if (lostCount == -1)
                         lostCount = ushort.MaxValue;
 
-                    CumulativePacketLost += (uint) lostCount;
+                    CumulativePacketLost += (uint)lostCount;
 
                     if (CumulativePacketLost > 0x7FFFFF)
                         CumulativePacketLost = 0x7FFFFF;
@@ -87,8 +87,9 @@ namespace RtspClientSharp.Rtp
                 return;
 
             TimeSpan timeOffset = _samplesFrequency != 0
-                ? new TimeSpan((long) (_samplesSum * 1000 / (uint) _samplesFrequency * TimeSpan.TicksPerMillisecond))
+                ? new TimeSpan((long)(_samplesSum * 1000 / (uint)_samplesFrequency * TimeSpan.TicksPerMillisecond))
                 : TimeSpan.MinValue;
+
 
             _mediaPayloadParser.Parse(timeOffset, rtpPacket.PayloadSegment, rtpPacket.MarkerBit);
         }

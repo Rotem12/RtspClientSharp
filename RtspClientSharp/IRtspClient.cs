@@ -20,7 +20,6 @@ namespace RtspClientSharp
         /// <exception cref="InvalidCredentialException"></exception>
         /// <exception cref="RtspClientException"></exception>
         Task ConnectAsync(CancellationToken token);
-
         /// <summary>
         /// Receive frames. 
         /// Should be called after successful connection to endpoint or <exception cref="InvalidOperationException"></exception> will be thrown

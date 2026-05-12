@@ -1,0 +1,14 @@
+prefix=C:/msys64/home/matan71/ffmpeg32
+exec_prefix=${prefix}
+libdir=C:/msys64/home/matan71/ffmpeg32/lib
+includedir=C:/msys64/home/matan71/ffmpeg32/include
+
+Name: libavformat
+Description: FFmpeg container format library
+Version: 61.9.106
+Requires: 
+Requires.private: libavcodec >= 61.33.100, libswresample >= 5.4.100, libavutil >= 59.56.100
+Conflicts:
+Libs: -L${libdir}  -lavformat 
+Libs.private: -lm -latomic -lbz2 -lz
+Cflags: -I${includedir}

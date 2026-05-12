@@ -54,4 +54,20 @@ More info: https://github.com/BogdanovKirill/RtspClientSharp/issues/49</PackageR
     <DocumentationFile>bin\Release\netstandard2.0\RtspClientSharp.xml</DocumentationFile>
   </PropertyGroup>
 
+  <ItemGroup>
+    <Compile Remove="TransportStream\Video\**" />
+    <EmbeddedResource Remove="TransportStream\Video\**" />
+    <None Remove="TransportStream\Video\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="TransportStream\CinegyDescriptor.cs" />
+    <Compile Remove="TransportStream\Descriptor.cs" />
+    <Compile Remove="TransportStream\DescriptorDictionaries.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Buffers" Version="4.6.0" />
+  </ItemGroup>
+
 </Project>

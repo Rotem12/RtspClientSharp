@@ -4,13 +4,14 @@ using System.Threading;
 using System.Threading.Tasks;
 using RtspClientSharp;
 using RtspClientSharp.RawFrames;
+using RtspClientSharp.RtpClient;
 using RtspClientSharp.Rtsp;
 
 namespace SimpleRtspPlayer.RawFramesReceiving
 {
     class RawFramesSource : IRawFramesSource
     {
-        private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan RetryDelay = TimeSpan.FromMilliseconds(200);
         private readonly ConnectionParameters _connectionParameters;
         private Task _workTask = Task.CompletedTask;
         private CancellationTokenSource _cancellationTokenSource;
@@ -45,6 +46,7 @@ namespace SimpleRtspPlayer.RawFramesReceiving
         {
             try
             {
+       //        using (var rtspClient = new RtpClient(_connectionParameters))
                 using (var rtspClient = new RtspClient(_connectionParameters))
                 {
                     rtspClient.FrameReceived += RtspClientOnFrameReceived;
@@ -70,7 +72,9 @@ namespace SimpleRtspPlayer.RawFramesReceiving
                             continue;
                         }
 
-                        OnStatusChanged("Receiving frames...");
+               //       while (true)
+               //     {
+                            OnStatusChanged("Receiving frames...");
 
                         try
                         {
@@ -81,6 +85,7 @@ namespace SimpleRtspPlayer.RawFramesReceiving
                             OnStatusChanged(e.ToString());
                             await Task.Delay(RetryDelay, token);
                         }
+               //             }
                     }
                 }
             }

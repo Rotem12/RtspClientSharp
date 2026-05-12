@@ -86,6 +86,14 @@ namespace SimpleRtspPlayer.GUI.Views
 
                 Application.Current.Dispatcher.Invoke(() =>
                 {
+                    int blockSize = 32;
+                    int spareW = width % blockSize;
+            //        int spareH = height % blockSize;
+
+                    if (spareW != 0) width -= spareW;
+
+             //       if (spareH != 0) height -= spareH;
+
                     ReinitializeBitmap(width, height);
                 }, DispatcherPriority.Send, token);
             }
