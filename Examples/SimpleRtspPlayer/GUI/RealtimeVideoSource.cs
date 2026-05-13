@@ -133,7 +133,14 @@ namespace SimpleRtspPlayer.GUI
 
             _hardwareAccelerationStatusMap[codecId] = isHardwareAccelerated;
 
-            string decoderMode = isHardwareAccelerated ? "D3D11VA hardware decode" : "software decode";
+            string decoderMode;
+            if (isHardwareAccelerated)
+                decoderMode = "D3D11VA hardware decode active";
+            else if (_hardwareAccelerationEnabled)
+                decoderMode = "D3D11VA unavailable; using software decode";
+            else
+                decoderMode = "software decode active";
+
             DecoderStatusChanged?.Invoke(this, $"{codecId}: {decoderMode}");
         }
     }
