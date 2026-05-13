@@ -54,5 +54,43 @@ namespace RtspClientSharp.UnitTests.Rtp
 
             mediaPayloadParserMock.Verify(x => x.ResetState());
         }
+
+        [TestMethod]
+        public void Process_DuplicatePacket_DoesNotCountAsLostOrParseTwice()
+        {
+            var testPacketBytes = new byte[]
+                {0x80, 0x60, 0x00, 0x01, 0x89, 0xBB, 0x82, 0xED, 0x42, 0x60, 0xD6, 0x86, 0x01};
+            var mediaPayloadParserMock = new Mock<IMediaPayloadParser>();
+
+            var rtpStream = new RtpStream(mediaPayloadParserMock.Object, 90000);
+            rtpStream.Process(new ArraySegment<byte>(testPacketBytes));
+            rtpStream.Process(new ArraySegment<byte>(testPacketBytes));
+
+            Assert.AreEqual(1, rtpStream.PacketsReceivedSinceLastReset);
+            Assert.AreEqual(0, rtpStream.PacketsLostSinceLastReset);
+            Assert.AreEqual(0u, rtpStream.CumulativePacketLost);
+            mediaPayloadParserMock.Verify(x => x.Parse(It.IsAny<TimeSpan>(), It.IsAny<ArraySegment<byte>>(), It.IsAny<bool>()),
+                Times.Once);
+        }
+
+        [TestMethod]
+        public void Process_OlderOutOfOrderPacket_DoesNotCountAsHugeLoss()
+        {
+            var testPacketBytes1 = new byte[]
+                {0x80, 0x60, 0x00, 0x02, 0x89, 0xBB, 0x82, 0xED, 0x42, 0x60, 0xD6, 0x86, 0x01};
+            var testPacketBytes2 = new byte[]
+                {0x80, 0x60, 0x00, 0x01, 0x89, 0xBB, 0x82, 0xED, 0x42, 0x60, 0xD6, 0x86, 0x02};
+            var mediaPayloadParserMock = new Mock<IMediaPayloadParser>();
+
+            var rtpStream = new RtpStream(mediaPayloadParserMock.Object, 90000);
+            rtpStream.Process(new ArraySegment<byte>(testPacketBytes1));
+            rtpStream.Process(new ArraySegment<byte>(testPacketBytes2));
+
+            Assert.AreEqual(1, rtpStream.PacketsReceivedSinceLastReset);
+            Assert.AreEqual(0, rtpStream.PacketsLostSinceLastReset);
+            Assert.AreEqual(0u, rtpStream.CumulativePacketLost);
+            Assert.AreEqual(0, rtpStream.SequenceCycles);
+            mediaPayloadParserMock.Verify(x => x.ResetState(), Times.Never);
+        }
     }
 }

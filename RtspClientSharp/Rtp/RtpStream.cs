@@ -25,6 +25,9 @@ namespace RtspClientSharp.Rtp
             IRtpSequenceAssembler rtpSequenceAssembler = null)
         {
             _mediaPayloadParser = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
+            if (samplesFrequency < 0)
+                throw new ArgumentOutOfRangeException(nameof(samplesFrequency));
+
             _samplesFrequency = samplesFrequency;
 
             if (rtpSequenceAssembler != null)
@@ -53,12 +56,12 @@ namespace RtspClientSharp.Rtp
             {
                 int delta = (ushort)(rtpPacket.SeqNumber - _previousSeqNumber);
 
+                if (delta == 0 || delta > ushort.MaxValue / 2)
+                    return;
+
                 if (delta != 1)
                 {
                     int lostCount = delta - 1;
-
-                    if (lostCount == -1)
-                        lostCount = ushort.MaxValue;
 
                     CumulativePacketLost += (uint)lostCount;
 
@@ -73,7 +76,7 @@ namespace RtspClientSharp.Rtp
                 if (rtpPacket.SeqNumber < HighestSequenceNumberReceived)
                     ++SequenceCycles;
 
-                _samplesSum += rtpPacket.Timestamp - _previousTimestamp;
+                _samplesSum += unchecked(rtpPacket.Timestamp - _previousTimestamp);
             }
 
             HighestSequenceNumberReceived = rtpPacket.SeqNumber;
@@ -87,7 +90,7 @@ namespace RtspClientSharp.Rtp
                 return;
 
             TimeSpan timeOffset = _samplesFrequency != 0
-                ? new TimeSpan((long)(_samplesSum * 1000 / (uint)_samplesFrequency * TimeSpan.TicksPerMillisecond))
+                ? TimeSpan.FromSeconds(_samplesSum / (double)_samplesFrequency)
                 : TimeSpan.MinValue;
 
 
