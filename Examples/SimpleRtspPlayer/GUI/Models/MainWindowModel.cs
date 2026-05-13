@@ -1,5 +1,7 @@
-﻿using System;
+using System;
 using RtspClientSharp;
+using RtspClientSharp.RawFrames;
+using RtspClientSharp.RawFrames.Audio;
 using SimpleRtspPlayer.RawFramesReceiving;
 
 namespace SimpleRtspPlayer.GUI.Models
@@ -10,6 +12,7 @@ namespace SimpleRtspPlayer.GUI.Models
         private readonly RealtimeAudioSource _realtimeAudioSource = new RealtimeAudioSource();
 
         private IRawFramesSource _rawFramesSource;
+        private bool _audioSourceAttached;
 
         public event EventHandler<string> StatusChanged;
 
@@ -30,11 +33,12 @@ namespace SimpleRtspPlayer.GUI.Models
             if (_rawFramesSource != null)
                 return;
 
+            _audioSourceAttached = false;
             _rawFramesSource = new RawFramesSource(connectionParameters);
             _rawFramesSource.ConnectionStatusChanged += ConnectionStatusChanged;
+            _rawFramesSource.FrameReceived += DetectAudioFrame;
 
             _realtimeVideoSource.SetRawFramesSource(_rawFramesSource);
-            _realtimeAudioSource.SetRawFramesSource(_rawFramesSource);
 
             _rawFramesSource.Start();
         }
@@ -45,8 +49,22 @@ namespace SimpleRtspPlayer.GUI.Models
                 return;
 
             _rawFramesSource.Stop();
+            _rawFramesSource.FrameReceived -= DetectAudioFrame;
             _realtimeVideoSource.SetRawFramesSource(null);
+            _realtimeAudioSource.SetRawFramesSource(null);
+            _audioSourceAttached = false;
             _rawFramesSource = null;
+        }
+
+        private void DetectAudioFrame(object sender, RawFrame rawFrame)
+        {
+            if (_audioSourceAttached || !(rawFrame is RawAudioFrame))
+                return;
+
+            _audioSourceAttached = true;
+            _rawFramesSource.FrameReceived -= DetectAudioFrame;
+            _realtimeAudioSource.SetRawFramesSource(_rawFramesSource);
+            StatusChanged?.Invoke(this, "Audio detected; audio decoding enabled");
         }
 
         private void ConnectionStatusChanged(object sender, string s)
