@@ -1,305 +1,301 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using RtspClientSharp.MediaParsers;
+using RtspClientSharp.RawFrames;
+using RtspClientSharp.RawFrames.Audio;
 
 namespace RtspClientSharp.Ts
 {
     class TsStream : ITransportStream
     {
-        private readonly IMediaPayloadParser _mediaPayloadParser;
-//        private const int TsPacketSize = 188;
+        private const double TimestampFrequency = 90000.0;
 
-        private TimeSpan _samplesSum = TimeSpan.Zero;
-        private TimeSpan _previousTimestamp;
+        private readonly IMediaPayloadParser _frameSink;
+        private readonly Dictionary<ushort, ElementaryStream> _streams = new Dictionary<ushort, ElementaryStream>();
+        private readonly Dictionary<ushort, Pes> _currentPesByPid = new Dictionary<ushort, Pes>();
+        private readonly TsPacketFactory _tsPacketFactory;
 
-        private bool _isFirstPacket = true;
+        private DateTime _baseTime;
+        private TimeSpan _currentTimeOffset;
+        private ushort _pmtPid;
 
         public int PacketsReceivedSinceLastReset { get; private set; }
         public int PacketsLostSinceLastReset { get; private set; }
 
-        private TsPacketFactory _tsPacketFactory;
-        private Pes _currentVideoPes;
-
-        private ushort VideoPid = 0;
-        private ushort PmtPid = 0;
-
-
         public TsStream(IMediaPayloadParser mediaPayloadParser)
         {
-            _mediaPayloadParser = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
-           _tsPacketFactory = new TsPacketFactory();
-           _tsPacketFactory.TsPacketReady += _tsPacketFactory_TsPacketReady;
-        }
-
-        private void _tsPacketFactory_TsPacketReady(object sender, TsPacketReadyEventArgs args)
-        {
-            TsPacket packet = args.TsPacket;
-
-            //if (!packet.ContainsPayload) return;
-
-            //switch (packet.Pid)
-            //{
-            //    case (ushort)PidType.PatPid:
-            //        for (int i = 8; i < packet.PayloadLen - 4; i += 4)
-            //        {
-            //            int programNumber = (packet.Payload[i] << 8) | packet.Payload[i + 1];
-            //            if (programNumber != 0)
-            //            {
-            //                PmtPid = (ushort)(((packet.Payload[i + 2] & 0x1F) << 8) | packet.Payload[i + 3]);
-            //                return;
-            //            }
-            //        }
-            //        return;
-            //    case (ushort)PidType.SdtBatPid:
-            //        break;
-            //    case (ushort)PidType.EitPid:
-            //        break;
-            //    case 2048:
-            //        break;
-            //    default:
-            //        var list = new List<string>();
-
-            //        int programInfoLength = ((packet.Payload[4] & 0x0F) << 8) | packet.Payload[5];
-            //        int startIndex = 12 + programInfoLength;
-
-            //        for (int i = startIndex; i < packet.PayloadLen; i += 5)
-            //        {
-            //            if (i + 4 >= packet.PayloadLen) break;
-
-            //            byte streamType = packet.Payload[i];
-            //            bool found = false;
-            //            if (streamType == 0x1B) // h2646
-            //            {
-            //                list.Add("h264");
-            //                found = true;
-            //            }
-            //            else if (streamType == 0x24) // hevc
-            //            {
-            //                list.Add("h265");
-            //                found = true;
-            //            }
-            //            else if (streamType == 0x10) // hevc
-            //            {
-            //                list.Add("mpeg4");
-            //                found = true;
-            //            }
-            //            else if (streamType == 0x02) // hevc
-            //            {
-            //                list.Add("mpeg2");
-            //                found = true;
-            //            }
-
-            //            if (found)
-            //            {
-            //                VideoPid = (ushort)(((packet.Payload[i + 1] & 0x1F) << 8) | packet.Payload[i + 2]);
-            //                return;
-            //            }
-
-            //        }
-            //        return;
-            //}
-
-      //           if (packet.Pid != VideoPid) return; 
-            if (packet.Pid != VideoPid && VideoPid != 0) return;
-
-            if (packet.PayloadUnitStartIndicator)
-            {
-
-                //         if(packet.PesHeader.Pts > -1)
-                //          {
-
-                //          }
-                if (_currentVideoPes != null)
-                {
-                    if (_currentVideoPes.Decode())
-                    {
-                        int startOfData = 6;
-                        bool marker;
-
-
-                        if (_currentVideoPes.OptionalPesHeader?.MarkerBits == 2) //optional PES header exists - minimum length is 3
-                        {
-                            startOfData += (ushort)(3 + _currentVideoPes.OptionalPesHeader.PesHeaderLength);
-                            marker = true;
-                        }
-                        else
-                        {
-                            marker = false;
-                        }
-
-                        var dataBufSize = _currentVideoPes.Data.Length - startOfData;
-
-                        var frame = new ArraySegment<byte>(_currentVideoPes.Data, startOfData, dataBufSize);
-                        TimeSpan time = _currentVideoPes.DTS;
-
-                        if (_isFirstPacket)
-                        {
-                            _isFirstPacket = false;
-                        }
-                        else
-                        {
-                            _samplesSum += time - _previousTimestamp;
-
-                        }
-                        _previousTimestamp = time;
-
-                        _mediaPayloadParser.Parse(_samplesSum, frame, markerBit: marker);
-                    }
-                }
-                Pes pes = new Pes(packet);
-                if (!pes.Dropped)
-                {
-                    _currentVideoPes = pes;
-
-                    if (packet.AdaptationFieldExists && packet.AdaptationField.PcrFlag)
-                    {
-                        VideoPid = packet.Pid;
-                    }
-
-                }
-           //     else
-           //     {
-           //         Console.WriteLine("dropped");
-           //     }
-            }
-            else
-            {
-                _currentVideoPes?.Add(packet);
-            }
-
-
-            //if (tsPacket.Pid != TsService?.VideoPid) return;
-
-            //if (tsPacket.PayloadUnitStartIndicator)
-            //{
-            //    if (tsPacket.PesHeader.Pts > -1)
-            //        LastPts = tsPacket.PesHeader.Pts;
-
-            //    if (_currentVideoPes != null)
-            //    {
-            //        _currentVideoPes.Decode();
-            //        TsService.AddData(_currentVideoPes, tsPacket.PesHeader, StreamType);
-            //    }
-            //    _currentVideoPes = new Pes(tsPacket);
-
-            //}
-            //else
-            //{
-            //    _currentVideoPes?.Add(tsPacket);
-            //}
+            _frameSink = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
+            _tsPacketFactory = new TsPacketFactory();
+            _tsPacketFactory.TsPacketReady += OnTsPacketReady;
         }
 
         public void Process(ArraySegment<byte> payloadSegment)
         {
-            _tsPacketFactory.PushData(payloadSegment.Array, payloadSegment.Count);
-
-            //if (payloadSegment.Count % TsPacketSize != 0)
-            //    return;
-
-            //int packetCount = payloadSegment.Count / TsPacketSize;
-
-            //for (int i = 0; i < packetCount; i++)
-            //{
-            //    var tsPacket = new ArraySegment<byte>(payloadSegment.Array, payloadSegment.Offset + i * TsPacketSize, TsPacketSize);
-
-            //    // validate sync byte
-            //    if(tsPacket.Array[tsPacket.Offset] != 0x47)
-            //    {
-            //        ++PacketsLostSinceLastReset;
-            //        continue;
-            //    }
-
-            //    ProcessTsPacket(tsPacket, i == 0, i == packetCount-1, i);
-           //     ++PacketsReceivedSinceLastReset;
-            //}
-        }
-
-        private void ProcessTsPacket(ArraySegment<byte> tsPacket, bool first, bool marker, int i)
-        {
-            byte syncByte = tsPacket.Array[tsPacket.Offset];
-            byte flags = tsPacket.Array[tsPacket.Offset + 1];
-
-            ushort pid = (ushort)(((tsPacket.Array[tsPacket.Offset + 1] & 0x1F) << 8) | tsPacket.Array[tsPacket.Offset + 2]);
-            byte adaptationFieldControl = (byte)((tsPacket.Array[tsPacket.Offset + 3] & 0x30) >> 4);
-
-            bool hasPayload = (adaptationFieldControl & 0x01) != 0;
-            bool hasAdaptationField = (adaptationFieldControl & 0x02) != 0;
-
-            if (!hasPayload && !hasAdaptationField) return;
-
-            TimeSpan timestamp;
-            int adaptationFieldLength = 0;
-            int payloadOffset = tsPacket.Offset + 4;
-
-            if(hasAdaptationField)
-            {
-                adaptationFieldLength = tsPacket.Array[payloadOffset];
-                payloadOffset += 1 + adaptationFieldLength;
-            }
-
-            if (adaptationFieldControl == 0x03)
-            {
-                adaptationFieldLength = tsPacket.Array[tsPacket.Offset + 4];
-                if(adaptationFieldLength > 0)
-                {
-                    const int baseIndex = 5;
-
-                    long pcrBase = (long)(tsPacket.Array[tsPacket.Offset + baseIndex] << 25 | 
-                                          tsPacket.Array[tsPacket.Offset + baseIndex + 1] << 17 | 
-                                          tsPacket.Array[tsPacket.Offset + baseIndex + 2] << 9 |
-                                          tsPacket.Array[tsPacket.Offset + baseIndex + 3] << 1 | 
-                                         (tsPacket.Array[tsPacket.Offset + baseIndex + 4] & 0x80) >> 7);
-
-                    int pcrExtension = (tsPacket.Array[tsPacket.Offset + baseIndex + 4] & 0x01) << 8 | tsPacket.Array[tsPacket.Offset + baseIndex + 5];
-
-                    timestamp = PcrToTimeSpan(pcrBase, pcrExtension);
-                }
-                else
-                {
-                    timestamp = TimeSpan.Zero;
-                }
-            }
-            else
-            {
-                timestamp = TimeSpan.Zero;
-            }
-
-            if (timestamp != TimeSpan.Zero)
-            {
-                _samplesSum += timestamp - _previousTimestamp;
-                _previousTimestamp = timestamp;
-            }
-            _isFirstPacket = false;
-
-            if (hasPayload)
-            {
-                int payloadLength = tsPacket.Offset + 188 - payloadOffset;
-
-                var payloadSegment = new ArraySegment<byte>(tsPacket.Array, payloadOffset, payloadLength);
-
-                //     index++;
-                //      bool marker = index == 6;
-                //     if(marker) index = 0;
-
-                _mediaPayloadParser.Parse(TimeSpan.MinValue, payloadSegment, markerBit: marker);
-            }
-        }
-
-    //    int index = 0;
-
-        private TimeSpan PcrToTimeSpan(long pcrBase, int pcrExtension)
-        {
-            double pcrInSeconds = pcrBase / 90000.0;
-
-            double extensionInSeconds = pcrExtension / 90000.0 / 1024;
-
-            return TimeSpan.FromSeconds(pcrInSeconds + extensionInSeconds);
+            _tsPacketFactory.PushData(payloadSegment);
         }
 
         public void ResetState()
         {
             PacketsLostSinceLastReset = 0;
             PacketsReceivedSinceLastReset = 0;
+            _currentPesByPid.Clear();
+
+            foreach (ElementaryStream stream in _streams.Values)
+                stream.Reset();
+        }
+
+        private void OnTsPacketReady(object sender, TsPacketReadyEventArgs args)
+        {
+            TsPacket packet = args.TsPacket;
+            PacketsReceivedSinceLastReset++;
+
+            if (!packet.ContainsPayload || packet.Payload == null || packet.PayloadLen <= 0)
+                return;
+
+            if (packet.Pid == (ushort)PidType.PatPid)
+            {
+                ParsePat(packet);
+                return;
+            }
+
+            if (_pmtPid != 0 && packet.Pid == _pmtPid)
+            {
+                ParsePmt(packet);
+                return;
+            }
+
+            if (!_streams.TryGetValue(packet.Pid, out ElementaryStream stream))
+                return;
+
+            if (packet.PayloadUnitStartIndicator)
+            {
+                FlushPes(packet.Pid, stream);
+
+                var pes = new Pes(packet);
+                if (!pes.Dropped)
+                    _currentPesByPid[packet.Pid] = pes;
+
+                return;
+            }
+
+            if (_currentPesByPid.TryGetValue(packet.Pid, out Pes currentPes))
+                currentPes.Add(packet);
+        }
+
+        private void ParsePat(TsPacket packet)
+        {
+            int payloadStart = GetPsiPayloadStart(packet);
+            if (payloadStart < 0 || payloadStart + 8 > packet.PayloadLen)
+                return;
+
+            int sectionLength = ((packet.Payload[payloadStart + 1] & 0x0F) << 8) | packet.Payload[payloadStart + 2];
+            int sectionEnd = Math.Min(packet.PayloadLen, payloadStart + 3 + sectionLength - 4);
+
+            for (int i = payloadStart + 8; i + 3 < sectionEnd; i += 4)
+            {
+                int programNumber = (packet.Payload[i] << 8) | packet.Payload[i + 1];
+                if (programNumber == 0)
+                    continue;
+
+                _pmtPid = (ushort)(((packet.Payload[i + 2] & 0x1F) << 8) | packet.Payload[i + 3]);
+                return;
+            }
+        }
+
+        private void ParsePmt(TsPacket packet)
+        {
+            int payloadStart = GetPsiPayloadStart(packet);
+            if (payloadStart < 0 || payloadStart + 12 > packet.PayloadLen)
+                return;
+
+            int sectionLength = ((packet.Payload[payloadStart + 1] & 0x0F) << 8) | packet.Payload[payloadStart + 2];
+            int sectionEnd = Math.Min(packet.PayloadLen, payloadStart + 3 + sectionLength - 4);
+            int programInfoLength = ((packet.Payload[payloadStart + 10] & 0x0F) << 8) | packet.Payload[payloadStart + 11];
+            int streamIndex = payloadStart + 12 + programInfoLength;
+
+            while (streamIndex + 4 < sectionEnd)
+            {
+                byte streamType = packet.Payload[streamIndex];
+                ushort elementaryPid = (ushort)(((packet.Payload[streamIndex + 1] & 0x1F) << 8) | packet.Payload[streamIndex + 2]);
+                int esInfoLength = ((packet.Payload[streamIndex + 3] & 0x0F) << 8) | packet.Payload[streamIndex + 4];
+
+                ElementaryStream stream = CreateElementaryStream(streamType);
+                if (stream != null)
+                {
+                    if (!_streams.TryGetValue(elementaryPid, out ElementaryStream existing) ||
+                        existing.StreamType != stream.StreamType)
+                    {
+                        _streams[elementaryPid] = stream;
+                    }
+                }
+
+                streamIndex += 5 + esInfoLength;
+            }
+        }
+
+        private static int GetPsiPayloadStart(TsPacket packet)
+        {
+            int payloadStart = 0;
+
+            if (packet.PayloadUnitStartIndicator)
+            {
+                if (packet.PayloadLen == 0)
+                    return -1;
+
+                payloadStart = packet.Payload[0] + 1;
+            }
+
+            return payloadStart < packet.PayloadLen ? payloadStart : -1;
+        }
+
+        private ElementaryStream CreateElementaryStream(byte streamType)
+        {
+            switch (streamType)
+            {
+                case 0x0F:
+                    return new ElementaryStream(streamType, ElementaryStreamKind.Aac, RaiseFrame, GetTimestamp);
+                case 0x1B:
+                    return new ElementaryStream(streamType, ElementaryStreamKind.H264, RaiseFrame, GetTimestamp);
+                case 0x24:
+                    return new ElementaryStream(streamType, ElementaryStreamKind.H265, RaiseFrame, GetTimestamp);
+                default:
+                    return null;
+            }
+        }
+
+        private void FlushPes(ushort pid, ElementaryStream stream)
+        {
+            if (!_currentPesByPid.TryGetValue(pid, out Pes pes))
+                return;
+
+            _currentPesByPid.Remove(pid);
+
+            if (!pes.Decode())
+                return;
+
+            int startOfData = 6;
+            if (pes.OptionalPesHeader != null && pes.OptionalPesHeader.MarkerBits == 2)
+                startOfData += 3 + pes.OptionalPesHeader.PesHeaderLength;
+
+            if (pes.Data == null || startOfData >= pes.Data.Length)
+                return;
+
+            TimeSpan timestamp = pes.Timestamp;
+            if (timestamp != TimeSpan.MinValue)
+                _currentTimeOffset = timestamp;
+
+            stream.Parse(new ArraySegment<byte>(pes.Data, startOfData, pes.Data.Length - startOfData));
+        }
+
+        private DateTime GetTimestamp()
+        {
+            if (_baseTime == default(DateTime))
+                _baseTime = DateTime.UtcNow;
+
+            return _baseTime + _currentTimeOffset;
+        }
+
+        private void RaiseFrame(RawFrame frame)
+        {
+            _frameSink.FrameGenerated?.Invoke(frame);
+        }
+
+        private enum ElementaryStreamKind
+        {
+            H264,
+            H265,
+            Aac
+        }
+
+        private sealed class ElementaryStream
+        {
+            private readonly Action<RawFrame> _frameGenerated;
+            private readonly Func<DateTime> _timestampProvider;
+            private readonly H264Parser _h264Parser;
+            private readonly H265Parser _h265Parser;
+            private byte[] _aacConfig = new byte[0];
+
+            public byte StreamType { get; }
+            private ElementaryStreamKind Kind { get; }
+
+            public ElementaryStream(byte streamType, ElementaryStreamKind kind, Action<RawFrame> frameGenerated,
+                Func<DateTime> timestampProvider)
+            {
+                StreamType = streamType;
+                Kind = kind;
+                _frameGenerated = frameGenerated;
+                _timestampProvider = timestampProvider;
+
+                if (kind == ElementaryStreamKind.H264)
+                    _h264Parser = new H264Parser(timestampProvider) { FrameGenerated = frameGenerated };
+                else if (kind == ElementaryStreamKind.H265)
+                    _h265Parser = new H265Parser(timestampProvider) { FrameGenerated = frameGenerated };
+            }
+
+            public void Parse(ArraySegment<byte> payload)
+            {
+                switch (Kind)
+                {
+                    case ElementaryStreamKind.H264:
+                        _h264Parser.Parse(payload, true);
+                        break;
+                    case ElementaryStreamKind.H265:
+                        _h265Parser.Parse(payload, true);
+                        break;
+                    case ElementaryStreamKind.Aac:
+                        ParseAdts(payload);
+                        break;
+                }
+            }
+
+            public void Reset()
+            {
+                _h264Parser?.ResetState();
+                _h265Parser?.ResetState();
+            }
+
+            private void ParseAdts(ArraySegment<byte> payload)
+            {
+                int offset = payload.Offset;
+                int end = payload.Offset + payload.Count;
+
+                while (offset + 7 <= end)
+                {
+                    byte[] buffer = payload.Array;
+                    if (buffer[offset] != 0xFF || (buffer[offset + 1] & 0xF0) != 0xF0)
+                        break;
+
+                    int protectionAbsent = buffer[offset + 1] & 0x01;
+                    int headerLength = protectionAbsent == 1 ? 7 : 9;
+                    int frameLength = ((buffer[offset + 3] & 0x03) << 11) |
+                                      (buffer[offset + 4] << 3) |
+                                      ((buffer[offset + 5] & 0xE0) >> 5);
+
+                    if (frameLength < headerLength || offset + frameLength > end)
+                        break;
+
+                    UpdateAacConfig(buffer, offset);
+
+                    var frame = new ArraySegment<byte>(buffer, offset + headerLength, frameLength - headerLength);
+                    _frameGenerated(new RawAACFrame(_timestampProvider(), frame, new ArraySegment<byte>(_aacConfig)));
+                    offset += frameLength;
+                }
+            }
+
+            private void UpdateAacConfig(byte[] buffer, int offset)
+            {
+                int profile = ((buffer[offset + 2] & 0xC0) >> 6) + 1;
+                int frequencyIndex = (buffer[offset + 2] & 0x3C) >> 2;
+                int channelConfig = ((buffer[offset + 2] & 0x01) << 2) | ((buffer[offset + 3] & 0xC0) >> 6);
+
+                byte config0 = (byte)((profile << 3) | (frequencyIndex >> 1));
+                byte config1 = (byte)(((frequencyIndex & 0x01) << 7) | (channelConfig << 3));
+
+                if (_aacConfig.Length == 2 && _aacConfig[0] == config0 && _aacConfig[1] == config1)
+                    return;
+
+                _aacConfig = new[] { config0, config1 };
+            }
         }
     }
 }

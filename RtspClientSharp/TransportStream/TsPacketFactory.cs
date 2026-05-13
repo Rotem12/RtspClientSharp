@@ -53,6 +53,21 @@ namespace RtspClientSharp.Ts
         /// </summary>
         /// <param name="data">Byte array containing TS stream data</param>
         /// <param name="dataSize">Optional length parameter to limit amount of data read from referenced array.</param>
+        public void PushData(ArraySegment<byte> data, bool retainPayload = true, bool preserveSourceData = false)
+        {
+            if (data.Array == null) throw new ArgumentNullException(nameof(data));
+
+            if (data.Offset == 0 && data.Count == data.Array.Length)
+            {
+                PushData(data.Array, data.Count, retainPayload, preserveSourceData);
+                return;
+            }
+
+            var payload = new byte[data.Count];
+            Buffer.BlockCopy(data.Array, data.Offset, payload, 0, data.Count);
+            PushData(payload, payload.Length, retainPayload, preserveSourceData);
+        }
+
         public void PushData(byte[] data, int dataSize = 0, bool retainPayload = true, bool preserveSourceData = false)
         {
             if (dataSize == 0)
@@ -60,15 +75,14 @@ namespace RtspClientSharp.Ts
                 dataSize = data.Length;
             }
 
-            TotalDataProcessed += dataSize;
-
-            var packets = GetTsPacketsFromData(data, dataSize, retainPayload, preserveSourceData);
+            int packetCount;
+            var packets = GetTsPacketsFromData(data, dataSize, retainPayload, preserveSourceData, false, out packetCount);
 
             if (packets != null)
             {
-                foreach (var tsPacket in packets)
+                for (int i = 0; i < packetCount; i++)
                 {
-                    OnTsPacketReadyDetected(tsPacket);
+                    OnTsPacketReadyDetected(packets[i]);
                 }
             }
         }
@@ -214,9 +228,23 @@ namespace RtspClientSharp.Ts
 
                         if (tsPacket.AdaptationFieldExists)
                         {
+                            byte adaptationFieldLength = data[payloadOffs++];
+                            if (adaptationFieldLength >= payloadSize)
+                            {
+                                return Flush(data, dataSize, rentedDataArray);
+                            }
+
+                            if (adaptationFieldLength == 0)
+                            {
+                                tsPacket.AdaptationField = new AdaptationField { FieldSize = 0 };
+                                payloadSize = TsPacketFixedSize - 5;
+                                payloadOffs = start + 5;
+                                goto CopyPayload;
+                            }
+
                             tsPacket.AdaptationField = new AdaptationField()
                             {
-                                FieldSize = data[payloadOffs++],
+                                FieldSize = adaptationFieldLength,
                                 DiscontinuityIndicator = (data[payloadOffs] & 0x80) != 0,
                                 RandomAccessIndicator = (data[payloadOffs] & 0x40) != 0,
                                 ElementaryStreamPriorityIndicator = (data[payloadOffs] & 0x20) != 0,
@@ -283,12 +311,13 @@ namespace RtspClientSharp.Ts
                             payloadOffs = start + 5 + tsPacket.AdaptationField.FieldSize;
                         }
 
+                    CopyPayload:
 
                         //if a packet has a payload start, check for a PES start-code and then map some key fields into a PesHdr struct for quick / easy access
                         if (tsPacket.ContainsPayload && tsPacket.PayloadUnitStartIndicator)
                      // if (tsPacket is { ContainsPayload: true, PayloadUnitStartIndicator: true })
                         {
-                            if (payloadOffs < dataSize - 1 && data[payloadOffs] == 0 && data[payloadOffs + 1] == 0 && data[payloadOffs + 2] == 1)
+                            if (payloadOffs + 8 < dataSize && data[payloadOffs] == 0 && data[payloadOffs + 1] == 0 && data[payloadOffs + 2] == 1)
                             {
                                 tsPacket.PesHeader = new PesHdr
                                 {
@@ -307,12 +336,20 @@ namespace RtspClientSharp.Ts
 
                                     tsPacket.PesHeader.HeaderLength = (byte)(3 + data[payloadOffs + 8]);
 
+                                    int packetEnd = start + TsPacketFixedSize;
+                                    if (payloadOffs + 6 + tsPacket.PesHeader.HeaderLength > packetEnd)
+                                        return Flush(data, dataSize, rentedDataArray);
+
                                     switch (ptsDtsFlag)
                                     {
                                         case 2:
+                                            if (payloadOffs + 13 >= packetEnd)
+                                                return Flush(data, dataSize, rentedDataArray);
                                             tsPacket.PesHeader.Pts = Get_TimeStamp(2, data, payloadOffs + 9);
                                             break;
                                         case 3:
+                                            if (payloadOffs + 18 >= packetEnd)
+                                                return Flush(data, dataSize, rentedDataArray);
                                             tsPacket.PesHeader.Pts = Get_TimeStamp(3, data, payloadOffs + 9);
                                             tsPacket.PesHeader.Dts = Get_TimeStamp(1, data, payloadOffs + 14);
                                             break;
@@ -470,11 +507,11 @@ namespace RtspClientSharp.Ts
 
             try
             {
-                var endOfSyncPos = 0;
                 for (var i = offset; i < dataLength; i++)
                 {
                     //check to see if we found a sync byte
                     if (tsData[i] != SyncByte) continue;
+                    var endOfSyncPos = i;
                     while (endOfSyncPos < dataLength)
                     {
                         endOfSyncPos += TsPacketFixedSize;
@@ -517,6 +554,10 @@ namespace RtspClientSharp.Ts
             if (rentedDataArray)
             {
                 sharedBytePool.Return(data);
+            }
+            if (_residualData != null)
+            {
+                sharedBytePool.Return(_residualData);
             }
             _residualData = null;
             _residualDataSz = 0;
