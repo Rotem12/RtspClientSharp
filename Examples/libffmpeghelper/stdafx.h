@@ -36,6 +36,13 @@ extern "C"
 }
 
 #include <d3d11.h>
+#include <dxgi.h>
+#include <d3dcompiler.h>
+
+extern "C"
+{
+	#include <libavutil/hwcontext_d3d11va.h>
+}
 //#include <wrl/client.h>
 //#include <d2d1_1.h>
 //#include <d2d1.h>

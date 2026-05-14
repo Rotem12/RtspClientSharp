@@ -4,21 +4,41 @@ struct VideoDecoderContext
 {
 	const AVCodec *codec;
 	AVCodecContext *av_codec_context;
-	AVPacket av_raw_packet;
 	AVFrame *frame;
 	AVFrame *software_frame;
 	AVFrame *active_frame;
 	AVBufferRef *hw_device_ctx;
 	AVPixelFormat hw_pixel_format;
 	bool hardware_enabled;
+	bool prefer_hardware;
+	HWND render_hwnd;
+	IDXGISwapChain *swap_chain;
+	ID3D11RenderTargetView *render_target_view;
+	ID3D11VertexShader *vertex_shader;
+	ID3D11PixelShader *pixel_shader;
+	ID3D11SamplerState *sampler_state;
+	ID3D11Buffer *crop_buffer;
+	ID3D11Texture2D *shader_texture;
+	ID3D11ShaderResourceView *shader_resource_view_y;
+	ID3D11ShaderResourceView *shader_resource_view_uv;
+	DXGI_FORMAT shader_texture_format;
+	int shader_texture_width;
+	int shader_texture_height;
+	int render_width;
+	int render_height;
+};
+
+struct RenderCropConstants
+{
+	float crop_left;
+	float crop_top;
+	float crop_right;
+	float crop_bottom;
 };
 
 struct ScalerContext
 {
-	//SwsContext *sws_context;
-	AVFilterGraph *filter_graph;
-	AVFilterContext *buffersrc_ctx;
-	AVFilterContext *buffersink_ctx;
+	SwsContext *sws_context;
 
 	int source_left;
 	int source_top;
@@ -27,8 +47,332 @@ struct ScalerContext
 	int scaled_width;
 	int scaled_height;
 	AVPixelFormat scaled_pixel_format;
-	bool hardware = false;
 };
+
+static void release_render_resources(VideoDecoderContext *context)
+{
+	if (!context)
+		return;
+
+	if (context->render_target_view)
+	{
+		context->render_target_view->Release();
+		context->render_target_view = nullptr;
+	}
+
+	if (context->swap_chain)
+	{
+		context->swap_chain->Release();
+		context->swap_chain = nullptr;
+	}
+
+	if (context->vertex_shader)
+	{
+		context->vertex_shader->Release();
+		context->vertex_shader = nullptr;
+	}
+
+	if (context->pixel_shader)
+	{
+		context->pixel_shader->Release();
+		context->pixel_shader = nullptr;
+	}
+
+	if (context->sampler_state)
+	{
+		context->sampler_state->Release();
+		context->sampler_state = nullptr;
+	}
+
+	if (context->crop_buffer)
+	{
+		context->crop_buffer->Release();
+		context->crop_buffer = nullptr;
+	}
+
+	if (context->shader_texture)
+	{
+		context->shader_texture->Release();
+		context->shader_texture = nullptr;
+	}
+
+	if (context->shader_resource_view_y)
+	{
+		context->shader_resource_view_y->Release();
+		context->shader_resource_view_y = nullptr;
+	}
+
+	if (context->shader_resource_view_uv)
+	{
+		context->shader_resource_view_uv->Release();
+		context->shader_resource_view_uv = nullptr;
+	}
+
+	context->shader_texture_format = DXGI_FORMAT_UNKNOWN;
+	context->shader_texture_width = 0;
+	context->shader_texture_height = 0;
+	context->render_width = 0;
+	context->render_height = 0;
+}
+
+static int compile_shader(const char *source, const char *entryPoint, const char *target, ID3DBlob **blob)
+{
+	ID3DBlob *errors = nullptr;
+	const HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr,
+		entryPoint, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob, &errors);
+
+	if (errors)
+		errors->Release();
+
+	return SUCCEEDED(hr) ? 0 : -1;
+}
+
+static int ensure_render_shaders(VideoDecoderContext *context, ID3D11Device *device)
+{
+	if (context->vertex_shader && context->pixel_shader && context->sampler_state && context->crop_buffer)
+		return 0;
+
+	const char *vertexShaderSource =
+		"cbuffer CropBuffer : register(b0) { float4 crop; };"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"VSOut main(uint id : SV_VertexID) {"
+		"  float2 pos[3] = { float2(-1.0,-1.0), float2(-1.0,3.0), float2(3.0,-1.0) };"
+		"  float2 uv[3] = { float2(0.0,1.0), float2(0.0,-1.0), float2(2.0,1.0) };"
+		"  VSOut output;"
+		"  output.pos = float4(pos[id], 0.0, 1.0);"
+		"  output.uv = float2(lerp(crop.x, 1.0 - crop.z, uv[id].x), lerp(crop.y, 1.0 - crop.w, uv[id].y));"
+		"  return output;"
+		"}";
+
+	const char *pixelShaderSource =
+		"Texture2D texY : register(t0);"
+		"Texture2D texUV : register(t1);"
+		"SamplerState samp : register(s0);"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"float4 main(VSOut input) : SV_TARGET {"
+		"  float y = texY.Sample(samp, input.uv).r;"
+		"  float2 uv = texUV.Sample(samp, input.uv).rg - float2(0.5, 0.5);"
+		"  float r = y + 1.5748 * uv.y;"
+		"  float g = y - 0.1873 * uv.x - 0.4681 * uv.y;"
+		"  float b = y + 1.8556 * uv.x;"
+		"  return float4(saturate(float3(r, g, b)), 1.0);"
+		"}";
+
+	ID3DBlob *vertexBlob = nullptr;
+	ID3DBlob *pixelBlob = nullptr;
+
+	if (compile_shader(vertexShaderSource, "main", "vs_4_0", &vertexBlob) != 0)
+		return -1;
+
+	if (compile_shader(pixelShaderSource, "main", "ps_4_0", &pixelBlob) != 0)
+	{
+		vertexBlob->Release();
+		return -2;
+	}
+
+	HRESULT hr = device->CreateVertexShader(vertexBlob->GetBufferPointer(), vertexBlob->GetBufferSize(),
+		nullptr, &context->vertex_shader);
+	vertexBlob->Release();
+	if (FAILED(hr))
+	{
+		pixelBlob->Release();
+		return -3;
+	}
+
+	hr = device->CreatePixelShader(pixelBlob->GetBufferPointer(), pixelBlob->GetBufferSize(),
+		nullptr, &context->pixel_shader);
+	pixelBlob->Release();
+	if (FAILED(hr))
+		return -4;
+
+	D3D11_SAMPLER_DESC samplerDesc = {};
+	samplerDesc.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+	samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samplerDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	samplerDesc.MinLOD = 0;
+	samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+
+	hr = device->CreateSamplerState(&samplerDesc, &context->sampler_state);
+	if (FAILED(hr))
+		return -5;
+
+	D3D11_BUFFER_DESC bufferDesc = {};
+	bufferDesc.ByteWidth = sizeof(RenderCropConstants);
+	bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+	bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+	hr = device->CreateBuffer(&bufferDesc, nullptr, &context->crop_buffer);
+	return SUCCEEDED(hr) ? 0 : -6;
+}
+
+static int ensure_swap_chain(VideoDecoderContext *context, ID3D11Device *device)
+{
+	if (!context->render_hwnd)
+		return -1;
+
+	RECT rect = {};
+	GetClientRect(context->render_hwnd, &rect);
+	const int width = max(1, rect.right - rect.left);
+	const int height = max(1, rect.bottom - rect.top);
+
+	if (context->swap_chain && context->render_width == width && context->render_height == height)
+		return 0;
+
+	if (context->render_target_view)
+	{
+		context->render_target_view->Release();
+		context->render_target_view = nullptr;
+	}
+
+	if (!context->swap_chain)
+	{
+		IDXGIDevice *dxgiDevice = nullptr;
+		IDXGIAdapter *adapter = nullptr;
+		IDXGIFactory *factory = nullptr;
+
+		if (FAILED(device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgiDevice))))
+			return -2;
+
+		if (FAILED(dxgiDevice->GetAdapter(&adapter)))
+		{
+			dxgiDevice->Release();
+			return -3;
+		}
+
+		if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory), reinterpret_cast<void **>(&factory))))
+		{
+			adapter->Release();
+			dxgiDevice->Release();
+			return -4;
+		}
+
+		DXGI_SWAP_CHAIN_DESC desc = {};
+		desc.BufferCount = 2;
+		desc.BufferDesc.Width = width;
+		desc.BufferDesc.Height = height;
+		desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		desc.OutputWindow = context->render_hwnd;
+		desc.SampleDesc.Count = 1;
+		desc.Windowed = TRUE;
+		desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+		const HRESULT hr = factory->CreateSwapChain(device, &desc, &context->swap_chain);
+
+		factory->Release();
+		adapter->Release();
+		dxgiDevice->Release();
+
+		if (FAILED(hr))
+			return -5;
+	}
+	else
+	{
+		if (FAILED(context->swap_chain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0)))
+			return -6;
+	}
+
+	ID3D11Texture2D *backBuffer = nullptr;
+	if (FAILED(context->swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&backBuffer))))
+		return -7;
+
+	const HRESULT hr = device->CreateRenderTargetView(backBuffer, nullptr, &context->render_target_view);
+	backBuffer->Release();
+
+	if (FAILED(hr))
+		return -8;
+
+	context->render_width = width;
+	context->render_height = height;
+	return 0;
+}
+
+static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *device, const D3D11_TEXTURE2D_DESC &sourceDesc)
+{
+	if (context->shader_texture &&
+		context->shader_texture_width == static_cast<int>(sourceDesc.Width) &&
+		context->shader_texture_height == static_cast<int>(sourceDesc.Height) &&
+		context->shader_texture_format == sourceDesc.Format &&
+		context->shader_resource_view_y &&
+		context->shader_resource_view_uv)
+	{
+		return 0;
+	}
+
+	if (context->shader_resource_view_y)
+	{
+		context->shader_resource_view_y->Release();
+		context->shader_resource_view_y = nullptr;
+	}
+
+	if (context->shader_resource_view_uv)
+	{
+		context->shader_resource_view_uv->Release();
+		context->shader_resource_view_uv = nullptr;
+	}
+
+	if (context->shader_texture)
+	{
+		context->shader_texture->Release();
+		context->shader_texture = nullptr;
+	}
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = sourceDesc.Width;
+	desc.Height = sourceDesc.Height;
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = sourceDesc.Format;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+	const HRESULT hr = device->CreateTexture2D(&desc, nullptr, &context->shader_texture);
+
+	if (FAILED(hr))
+		return -1;
+
+	DXGI_FORMAT yFormat = DXGI_FORMAT_UNKNOWN;
+	DXGI_FORMAT uvFormat = DXGI_FORMAT_UNKNOWN;
+
+	if (sourceDesc.Format == DXGI_FORMAT_NV12)
+	{
+		yFormat = DXGI_FORMAT_R8_UNORM;
+		uvFormat = DXGI_FORMAT_R8G8_UNORM;
+	}
+	else if (sourceDesc.Format == DXGI_FORMAT_P010 || sourceDesc.Format == DXGI_FORMAT_P016)
+	{
+		yFormat = DXGI_FORMAT_R16_UNORM;
+		uvFormat = DXGI_FORMAT_R16G16_UNORM;
+	}
+	else
+	{
+		return -2;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC yDesc = {};
+	yDesc.Format = yFormat;
+	yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	yDesc.Texture2D.MostDetailedMip = 0;
+	yDesc.Texture2D.MipLevels = 1;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc = yDesc;
+	uvDesc.Format = uvFormat;
+
+	if (FAILED(device->CreateShaderResourceView(context->shader_texture, &yDesc, &context->shader_resource_view_y)))
+		return -3;
+
+	if (FAILED(device->CreateShaderResourceView(context->shader_texture, &uvDesc, &context->shader_resource_view_uv)))
+		return -4;
+
+	context->shader_texture_width = static_cast<int>(sourceDesc.Width);
+	context->shader_texture_height = static_cast<int>(sourceDesc.Height);
+	context->shader_texture_format = sourceDesc.Format;
+	return 0;
+}
 
 //struct DrawContext
 //{
@@ -295,6 +639,44 @@ static void fallback_to_software_decoder(VideoDecoderContext *context)
 	open_decoder(context, false);
 }
 
+static int recreate_decoder_with_extradata(VideoDecoderContext *context, void *extradata, int extradataLength)
+{
+	if (!context || !extradata || extradataLength <= 0)
+		return -1;
+
+	AVCodecContext *newCodecContext = avcodec_alloc_context3(context->codec);
+	if (!newCodecContext)
+		return -2;
+
+	newCodecContext->extradata = static_cast<uint8_t *>(av_malloc(extradataLength + AV_INPUT_BUFFER_PADDING_SIZE));
+	if (!newCodecContext->extradata)
+	{
+		avcodec_free_context(&newCodecContext);
+		return -3;
+	}
+
+	memcpy(newCodecContext->extradata, extradata, extradataLength);
+	memset(newCodecContext->extradata + extradataLength, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+	newCodecContext->extradata_size = extradataLength;
+
+	AVCodecContext *oldCodecContext = context->av_codec_context;
+	context->av_codec_context = newCodecContext;
+	context->hardware_enabled = false;
+	context->hw_pixel_format = AV_PIX_FMT_NONE;
+	av_buffer_unref(&context->hw_device_ctx);
+
+	if (open_decoder(context, context->prefer_hardware) < 0)
+	{
+		avcodec_free_context(&context->av_codec_context);
+		context->av_codec_context = oldCodecContext;
+		open_decoder(context, false);
+		return -4;
+	}
+
+	avcodec_free_context(&oldCodecContext);
+	return 0;
+}
+
 int create_video_decoder_with_options(int codec_id, int preferHardwareAcceleration, void **handle)
 {
 	if (!handle)
@@ -324,6 +706,7 @@ int create_video_decoder_with_options(int codec_id, int preferHardwareAccelerati
 		remove_video_decoder(context);
 		return -5;
 	}
+	context->prefer_hardware = preferHardwareAcceleration != 0;
 
 	context->frame = av_frame_alloc();
 	if (!context->frame)
@@ -339,8 +722,6 @@ int create_video_decoder_with_options(int codec_id, int preferHardwareAccelerati
 		return -7;
 	}
 
-	av_init_packet(&context->av_raw_packet);
-
 	*handle = context;
 
 	return 0;
@@ -355,23 +736,7 @@ int set_video_decoder_extradata(void *handle, void *extradata, int extradataLeng
 
 	const auto context = static_cast<VideoDecoderContext *>(handle);
 
-	if (!context->av_codec_context->extradata || context->av_codec_context->extradata_size < extradataLength)
-	{
-		av_free(context->av_codec_context->extradata);
-		context->av_codec_context->extradata = static_cast<uint8_t*>(av_malloc(extradataLength + AV_INPUT_BUFFER_PADDING_SIZE));
-
-		if (!context->av_codec_context->extradata)
-			return -2;
-	}
-
-	context->av_codec_context->extradata_size = extradataLength;
-
-	memcpy(context->av_codec_context->extradata, extradata, extradataLength);
-	memset(context->av_codec_context->extradata + extradataLength, 0, AV_INPUT_BUFFER_PADDING_SIZE);
-	
-	avcodec_close(context->av_codec_context);
-	av_buffer_unref(&context->av_codec_context->hw_device_ctx);
-	if (open_decoder(context, true) < 0)
+	if (recreate_decoder_with_extradata(context, extradata, extradataLength) < 0)
 		return -3;
 
 	return 0;
@@ -393,10 +758,12 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 	av_frame_unref(context->software_frame);
 	context->active_frame = nullptr;
 
-	context->av_raw_packet.data = static_cast<uint8_t *>(rawBuffer);
-	context->av_raw_packet.size = rawBufferLength;
+	AVPacket packet;
+	av_init_packet(&packet);
+	packet.data = static_cast<uint8_t *>(rawBuffer);
+	packet.size = rawBufferLength;
 
-	int len = avcodec_send_packet(context->av_codec_context, &context->av_raw_packet);
+	int len = avcodec_send_packet(context->av_codec_context, &packet);
 
 	if (len < 0)
 		return -3;
@@ -426,9 +793,155 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 	return 0;
 }
 
+int set_video_decoder_render_target(void *handle, void *hwnd)
+{
+	if (!handle)
+		return -1;
+
+	auto context = static_cast<VideoDecoderContext *>(handle);
+
+	if (context->render_hwnd != reinterpret_cast<HWND>(hwnd))
+	{
+		release_render_resources(context);
+		context->render_hwnd = reinterpret_cast<HWND>(hwnd);
+	}
+
+	return context->render_hwnd ? 0 : -2;
+}
+
+int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength, int *frameWidth, int *frameHeight, int *framePixelFormat)
+{
+#if _DEBUG
+	if (!handle || !rawBuffer || !rawBufferLength || !frameWidth || !frameHeight || !framePixelFormat)
+		return -1;
+#endif
+
+	auto context = static_cast<VideoDecoderContext *>(handle);
+
+	if (!context->hardware_enabled)
+		return -2;
+
+	av_frame_unref(context->frame);
+	av_frame_unref(context->software_frame);
+	context->active_frame = nullptr;
+
+	AVPacket packet;
+	av_init_packet(&packet);
+	packet.data = static_cast<uint8_t *>(rawBuffer);
+	packet.size = rawBufferLength;
+
+	int len = avcodec_send_packet(context->av_codec_context, &packet);
+
+	if (len < 0)
+		return -3;
+
+	len = avcodec_receive_frame(context->av_codec_context, context->frame);
+
+	if (len < 0)
+		return -4;
+
+	if (context->frame->format != context->hw_pixel_format)
+		return -5;
+
+	context->active_frame = context->frame;
+	*frameWidth = context->active_frame->width;
+	*frameHeight = context->active_frame->height;
+	*framePixelFormat = context->active_frame->format;
+
+	return 0;
+}
+
+int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop, double cropRight, double cropBottom)
+{
+	if (!handle)
+		return -1;
+
+	auto context = static_cast<VideoDecoderContext *>(handle);
+
+	if (!context->active_frame || context->active_frame->format != context->hw_pixel_format)
+		return -2;
+
+	if (!context->hw_device_ctx || !context->render_hwnd)
+		return -3;
+
+	auto deviceContext = reinterpret_cast<AVHWDeviceContext *>(context->hw_device_ctx->data);
+	auto d3d11Context = static_cast<AVD3D11VADeviceContext *>(deviceContext->hwctx);
+
+	if (!d3d11Context || !d3d11Context->device || !d3d11Context->device_context)
+		return -4;
+
+	ID3D11Device *device = d3d11Context->device;
+	ID3D11DeviceContext *immediateContext = d3d11Context->device_context;
+
+	int result = ensure_render_shaders(context, device);
+	if (result != 0)
+		return -10 + result;
+
+	result = ensure_swap_chain(context, device);
+	if (result != 0)
+		return -20 + result;
+
+	ID3D11Texture2D *texture = reinterpret_cast<ID3D11Texture2D *>(context->active_frame->data[0]);
+	const UINT arraySlice = static_cast<UINT>(reinterpret_cast<uintptr_t>(context->active_frame->data[1]));
+
+	if (!texture)
+		return -5;
+
+	D3D11_TEXTURE2D_DESC textureDesc = {};
+	texture->GetDesc(&textureDesc);
+
+	if (textureDesc.Format != DXGI_FORMAT_NV12 &&
+		textureDesc.Format != DXGI_FORMAT_P010 &&
+		textureDesc.Format != DXGI_FORMAT_P016)
+		return -8;
+
+	result = ensure_shader_texture(context, device, textureDesc);
+	if (result != 0)
+		return -30 + result;
+
+	immediateContext->CopySubresourceRegion(context->shader_texture, 0, 0, 0, 0,
+		texture, D3D11CalcSubresource(0, arraySlice, 1), nullptr);
+
+	ID3D11ShaderResourceView *views[2] = { context->shader_resource_view_y, context->shader_resource_view_uv };
+
+	D3D11_MAPPED_SUBRESOURCE mapped = {};
+	if (SUCCEEDED(immediateContext->Map(context->crop_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+	{
+		auto constants = static_cast<RenderCropConstants *>(mapped.pData);
+		constants->crop_left = static_cast<float>(cropLeft);
+		constants->crop_top = static_cast<float>(cropTop);
+		constants->crop_right = static_cast<float>(cropRight);
+		constants->crop_bottom = static_cast<float>(cropBottom);
+		immediateContext->Unmap(context->crop_buffer, 0);
+	}
+
+	D3D11_VIEWPORT viewport = {};
+	viewport.Width = static_cast<float>(context->render_width);
+	viewport.Height = static_cast<float>(context->render_height);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+
+	immediateContext->OMSetRenderTargets(1, &context->render_target_view, nullptr);
+	immediateContext->RSSetViewports(1, &viewport);
+	immediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	immediateContext->VSSetShader(context->vertex_shader, nullptr, 0);
+	immediateContext->VSSetConstantBuffers(0, 1, &context->crop_buffer);
+	immediateContext->PSSetShader(context->pixel_shader, nullptr, 0);
+	immediateContext->PSSetShaderResources(0, 2, views);
+	immediateContext->PSSetSamplers(0, 1, &context->sampler_state);
+	immediateContext->Draw(3, 0);
+
+	ID3D11ShaderResourceView *nullViews[2] = {};
+	immediateContext->PSSetShaderResources(0, 2, nullViews);
+
+	context->swap_chain->Present(0, 0);
+
+	return 0;
+}
+
 int create_video_decoder(int codec_id, void **handle)
 {
-	return create_video_decoder_with_options(codec_id, 1, handle);
+	return create_video_decoder_with_options(codec_id, 0, handle);
 }
 
 int is_video_decoder_hardware_accelerated(void *handle)
@@ -451,76 +964,35 @@ int scale_decoded_video_frame(void *handle, void *scalerHandle, void *scaledBuff
 	const auto scalerContext = static_cast<ScalerContext *>(scalerHandle);
 	AVFrame *sourceFrame = context->active_frame ? context->active_frame : context->frame;
 
-	//if (!scalerContext->hardware)
-	//{
-	//	AVBufferRef* hw = av_hwdevice_ctx_create($hw, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0)
-
-	//	av_opt_set_bin(scalerContext->buffersrc_ctx, "hw_device_ctx", (const uint8_t*)hw->data, sizeof(hw->data), AV_OPT_SEARCH_CHILDREN);
-	//	av_opt_set_bin(scalerContext->buffersink_ctx, "hw_device_ctx", (const uint8_t*)hw->data, sizeof(hw->data), AV_OPT_SEARCH_CHILDREN);
-	//	scalerContext->hardware = true;
-
-	//	scalerContext->buffersrc_ctx->hw_device_ctx = context->hw_device_ctx;
-	//}
-
-	AVFrame *scaled_frame = av_frame_alloc();
-	if (!scaled_frame)
-		return -2;
-
-	scaled_frame->format = scalerContext->scaled_pixel_format;
-	scaled_frame->width = scalerContext->scaled_width;
-	scaled_frame->height = scalerContext->scaled_height;
-	scaled_frame->linesize[0] = scaledBufferStride;
-	scaled_frame->data[0] = (uint8_t *)scaledBuffer;
-
-	int ret = av_buffersrc_add_frame_flags(scalerContext->buffersrc_ctx, sourceFrame, AV_BUFFERSRC_FLAG_KEEP_REF);
-	if (ret < 0)
+	if (scalerContext->source_top != 0 || scalerContext->source_left != 0)
 	{
-		av_frame_free(&scaled_frame);
-		return ret;
-	}
+		const AVPixFmtDescriptor *sourceFmtDesc = av_pix_fmt_desc_get(scalerContext->source_pixel_format);
 
-	ret = av_buffersink_get_frame(scalerContext->buffersink_ctx, scaled_frame);
-	if (ret < 0)
+		if (!sourceFmtDesc)
+			return -4;
+
+		const int x_shift = sourceFmtDesc->log2_chroma_w;
+		const int y_shift = sourceFmtDesc->log2_chroma_h;
+		
+		uint8_t *srcData[8];
+
+		srcData[0] = sourceFrame->data[0] + scalerContext->source_top * sourceFrame->linesize[0] + scalerContext->source_left;
+		srcData[1] = sourceFrame->data[1] + (scalerContext->source_top >> y_shift) * sourceFrame->linesize[1] + (scalerContext->source_left >> x_shift);
+		srcData[2] = sourceFrame->data[2] + (scalerContext->source_top >> y_shift) * sourceFrame->linesize[2] + (scalerContext->source_left >> x_shift);
+		srcData[3] = nullptr;
+		srcData[4] = nullptr;
+		srcData[5] = nullptr;
+		srcData[6] = nullptr;
+		srcData[7] = nullptr;
+
+		sws_scale(scalerContext->sws_context, srcData, sourceFrame->linesize, 0,
+			scalerContext->source_height, reinterpret_cast<uint8_t **>(&scaledBuffer), &scaledBufferStride);
+	}
+	else
 	{
-		av_frame_free(&scaled_frame);
-		return ret;
+		sws_scale(scalerContext->sws_context, sourceFrame->data, sourceFrame->linesize, 0,
+			scalerContext->source_height, reinterpret_cast<uint8_t **>(&scaledBuffer), &scaledBufferStride);
 	}
-
-	memcpy(scaledBuffer, scaled_frame->data[0], scaledBufferStride * scaled_frame->height);
-
-	av_frame_unref(scaled_frame);
-	av_frame_free(&scaled_frame);
-
-
-	//if (scalerContext->source_top != 0 || scalerContext->source_left != 0)
-	//{
-	//	const AVPixFmtDescriptor *sourceFmtDesc = av_pix_fmt_desc_get(scalerContext->source_pixel_format);
-
-	//	if (!sourceFmtDesc)
-	//		return -4;
-
-	//	const int x_shift = sourceFmtDesc->log2_chroma_w;
-	//	const int y_shift = sourceFmtDesc->log2_chroma_h;
-	//	
-	//	uint8_t *srcData[8];
-
-	//	srcData[0] = context->frame->data[0] + scalerContext->source_top * context->frame->linesize[0] + scalerContext->source_left;
-	//	srcData[1] = context->frame->data[1] + (scalerContext->source_top >> y_shift) * context->frame->linesize[1] + (scalerContext->source_left >> x_shift);
-	//	srcData[2] = context->frame->data[2] + (scalerContext->source_top >> y_shift) * context->frame->linesize[2] + (scalerContext->source_left >> x_shift);
-	//	srcData[3] = nullptr;
-	//	srcData[4] = nullptr;
-	//	srcData[5] = nullptr;
-	//	srcData[6] = nullptr;
-	//	srcData[7] = nullptr;
-
-	//	sws_scale(scalerContext->sws_context, srcData, context->frame->linesize, 0,
-	//		scalerContext->source_height, reinterpret_cast<uint8_t **>(&scaledBuffer), &scaledBufferStride);
-	//}
-	//else
-	//{
-	//	sws_scale(scalerContext->sws_context, context->frame->data, context->frame->linesize, 0,
-	//		scalerContext->source_height, reinterpret_cast<uint8_t **>(&scaledBuffer), &scaledBufferStride);
-	//}
 
 	return 0;
 }
@@ -531,6 +1003,8 @@ void remove_video_decoder(void *handle)
 		return;
 
 	auto context = static_cast<VideoDecoderContext *>(handle);
+
+	release_render_resources(context);
 	
 	if (context->av_codec_context)
 	{
@@ -557,87 +1031,16 @@ int create_video_scaler(int sourceLeft, int sourceTop, int sourceWidth, int sour
 	if (!context)
 		return -2;
 
-	// init filter graph for directx scaling
-	AVFilterGraph *filter_graph = avfilter_graph_alloc();
-	if (!filter_graph)
+	SwsContext *swsContext = sws_getContext(sourceWidth, sourceHeight, sourceAvPixelFormat, scaledWidth, scaledHeight,
+		scaledAvPixelFormat, quality, nullptr, nullptr, nullptr);
+	
+	if (!swsContext)
+	{
+		remove_video_scaler(context);
 		return -3;
+	}
 
-	// buffer source and sink
-	AVFilterContext *buffersrc_ctx, *buffersink_ctx;
-	const AVFilter *buffersrc = avfilter_get_by_name("buffer");
-	const AVFilter *buffersink = avfilter_get_by_name("buffersink");
-
-	char args[512];
-	snprintf(args, sizeof(args), "video_size=%dx%d:pix_fmt=%d:time_base=1/25", sourceWidth, sourceHeight, sourcePixelFormat);
-
-	//create the buffer source context
-	int ret = avfilter_graph_create_filter(&buffersrc_ctx, buffersrc, "in", args, NULL, filter_graph);
-	if (ret < 0)
-		return ret;
-
-	//create the buffer sink context
-	ret = avfilter_graph_create_filter(&buffersink_ctx, buffersink, "out", NULL, NULL, filter_graph);
-	if (ret < 0)
-		return ret;
-
-
-	/*AVBufferRef* hw;
-	ret = av_hwdevice_ctx_create(&hw, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0);
-	if (ret < 0)
-		printf("failed");
-
-	ret = av_opt_set_bin(buffersrc_ctx, "hw_device_ctx", (const uint8_t*)hw->data, sizeof(hw->data), AV_OPT_SEARCH_CHILDREN);
-	if (ret < 0)
-		printf("failed");
-	ret = av_opt_set_bin(buffersink_ctx, "hw_device_ctx", (const uint8_t*)hw->data, sizeof(hw->data), AV_OPT_SEARCH_CHILDREN);
-	if (ret < 0)
-		printf("failed");*/
-
-
-	AVFilterContext *scale_ctx;
-	const AVFilter *scale = avfilter_get_by_name("scale");
-
-	//scale
-	snprintf(args, sizeof(args), "%d:%d", scaledWidth, scaledHeight);
-	ret = avfilter_graph_create_filter(&scale_ctx, scale, "scale", args, NULL, filter_graph);
-	if (ret < 0)
-		return ret;
-
-	AVFilterContext* format_ctx;
-	const AVFilter* format = avfilter_get_by_name("format");
-
-	snprintf(args, sizeof(args), "pix_fmts=%d", scaledPixelFormat);
-	ret = avfilter_graph_create_filter(&format_ctx, format, "format", args, NULL, filter_graph);
-	if (ret < 0)
-		return ret;
-
-	//link the filters
-	ret = avfilter_link(buffersrc_ctx, 0, scale_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(scale_ctx, 0, format_ctx, 0);
-	if (ret >= 0) ret = avfilter_link(format_ctx, 0, buffersink_ctx, 0);
-	if (ret < 0)
-		return ret;
-
-//	//configure the filter graph
-	ret = avfilter_graph_config(filter_graph, NULL);
-	if (ret < 0)
-		return ret;
-
-//	//save context information
-	context->filter_graph = filter_graph;
-	context->buffersrc_ctx = buffersrc_ctx;
-	context->buffersink_ctx = buffersink_ctx;
-
-	//SwsContext *swsContext = sws_getContext(sourceWidth, sourceHeight, sourceAvPixelFormat, scaledWidth, scaledHeight,
-	//	scaledAvPixelFormat, quality, nullptr, nullptr, nullptr);
-	//
-	//if (!swsContext)
-	//{
-	//	remove_video_scaler(context);
-	//	return -3;
-	//}
-
-	//context->sws_context = swsContext;
+	context->sws_context = swsContext;
 	context->source_left = sourceLeft;
 	context->source_top = sourceTop;
 	context->source_height = sourceHeight;
@@ -657,12 +1060,7 @@ void remove_video_scaler(void *handle)
 
 	const auto context = static_cast<ScalerContext *>(handle);
 
-	if (context->filter_graph)
-	{
-		avfilter_graph_free(&context->filter_graph);
-	}
-
-//	sws_freeContext(context->sws_context);
+	sws_freeContext(context->sws_context);
 	av_free(context);
 }
 
