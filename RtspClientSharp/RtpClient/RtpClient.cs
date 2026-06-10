@@ -269,12 +269,7 @@ namespace RtspClientSharp.RtpClient
 
                 if (IsMulticast(address))
                 {
-                    int[] interfaces = GetMulticastCapableInterfaceIndex();
-                    foreach (int i in interfaces)
-                    {
-                        //                 if(i.ToString() == "192.168.1.100")
-                        client.JoinMulticastGroup(i, address);
-                    }
+                    JoinMulticastGroup(client, address);
                 }
 
                 //if(address.Address == IPAddress.Broadcast.Address)
@@ -284,6 +279,50 @@ namespace RtspClientSharp.RtpClient
             }
 
             return client;
+        }
+
+        private void JoinMulticastGroup(UdpClient client, IPAddress multicastAddress)
+        {
+            IPAddress multicastInterfaceAddress = ConnectionParameters.MulticastInterfaceAddress;
+            if (multicastInterfaceAddress != null)
+            {
+                client.JoinMulticastGroup(multicastAddress, multicastInterfaceAddress);
+                return;
+            }
+
+            if (multicastAddress.AddressFamily == AddressFamily.InterNetworkV6)
+            {
+                foreach (int i in GetMulticastCapableInterfaceIndex())
+                    client.JoinMulticastGroup(i, multicastAddress);
+
+                return;
+            }
+
+            IPAddress[] interfaces = GetMulticastCapableInterface();
+            if (interfaces.Length == 0)
+            {
+                client.JoinMulticastGroup(multicastAddress);
+                return;
+            }
+
+            Exception lastException = null;
+            bool joined = false;
+
+            foreach (IPAddress localAddress in interfaces)
+            {
+                try
+                {
+                    client.JoinMulticastGroup(multicastAddress, localAddress);
+                    joined = true;
+                }
+                catch (Exception e) when (e is SocketException || e is ArgumentException)
+                {
+                    lastException = e;
+                }
+            }
+
+            if (!joined && lastException != null)
+                throw lastException;
         }
 
 

@@ -343,10 +343,8 @@ namespace RtspClientSharp.Rtsp
 
                 try
                 {
-                    // if we are conected to several networks, take local IP from already existing TCP connection
-                    IPAddress localIpToServer = IPAddress.Any;
-                    if (_rtspTransportClient.LocalEndPoint is IPEndPoint localIpEndPoint)
-                        localIpToServer = localIpEndPoint.Address;
+                    // if we are connected to several networks, take local IP from already existing TCP connection
+                    IPAddress localIpToServer = GetMulticastInterfaceAddress();
 
                     IPEndPoint endPointRtp = new IPEndPoint(localIpToServer, rtpChannelNumber);
 
@@ -412,6 +410,17 @@ namespace RtspClientSharp.Rtsp
 
             var rtcpReportsProvider = new RtcpReceiverReportsProvider(rtpStream, rtcpStream, senderSyncSourceId);
             _reportProvidersMap.Add(rtpChannelNumber, rtcpReportsProvider);
+        }
+
+        private IPAddress GetMulticastInterfaceAddress()
+        {
+            if (_connectionParameters.MulticastInterfaceAddress != null)
+                return _connectionParameters.MulticastInterfaceAddress;
+
+            if (_rtspTransportClient.LocalEndPoint is IPEndPoint localIpEndPoint)
+                return localIpEndPoint.Address;
+
+            return IPAddress.Any;
         }
 
         private async Task SendRtspKeepAliveAsync(CancellationToken token)

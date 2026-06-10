@@ -29,6 +29,10 @@ namespace RtspClientSharp
         public string UserAgent { get; set; } = DefaultUserAgent;
         public RtpTransportProtocol RtpTransport { get; set; } = RtpTransportProtocol.TCP;
         public Uri StreamUri { get; }
+        /// <summary>
+        /// Local network interface address used to join multicast groups. Leave null to auto-select.
+        /// </summary>
+        public IPAddress MulticastInterfaceAddress { get; set; }
         public bool UseTS { get; set; } = false;
    //     public Codecs.Video.CodecInfoType Parser { get; set; } = Codecs.Video.CodecInfoType.H264;
 
