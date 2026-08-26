@@ -52,7 +52,7 @@ namespace RtspClientSharp.Utils
                     else
                         sourceIp = IPAddress.None;
                 }
-                if (!IPAddress.None.Equals(sourceIp))
+                if (!IPAddress.None.Equals(sourceIp) && IsSourceSpecificMulticastGroup(multicastGroupIp))
                 {
                     byte[] membershipAddresses = new byte[12]; // 3 IPs * 4 bytes (IPv4)
                     Buffer.BlockCopy(multicastGroupIp.GetAddressBytes(), 0, membershipAddresses, 0, 4);
@@ -78,7 +78,7 @@ namespace RtspClientSharp.Utils
                 {
                     sourceIp = sourceIp.MapToIPv6();
                 }
-                if (!IPAddress.None.Equals(sourceIp))
+                if (!IPAddress.None.Equals(sourceIp) && IsSourceSpecificMulticastGroup(multicastGroupIp))
                 {
                     byte[] membershipAddresses = new byte[48]; // 3 IPs * 16 bytes (IPv6)
                     Buffer.BlockCopy(multicastGroupIp.GetAddressBytes(), 0, membershipAddresses, 0, 16);
@@ -95,6 +95,14 @@ namespace RtspClientSharp.Utils
                 }
             }
             return rtcpToSource;
+        }
+
+        private static bool IsSourceSpecificMulticastGroup(IPAddress multicastGroupIp)
+        {
+            if (multicastGroupIp.AddressFamily == AddressFamily.InterNetwork)
+                return multicastGroupIp.GetAddressBytes()[0] == 232;
+
+            return false;
         }
     }
 }

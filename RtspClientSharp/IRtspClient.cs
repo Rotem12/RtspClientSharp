@@ -11,6 +11,13 @@ namespace RtspClientSharp
     {
         ConnectionParameters ConnectionParameters { get; }
 
+        /// <summary>
+        /// Raised on the parser/receive path before the bounded display dispatcher
+        /// copies or drops the frame. Subscribers must consume the frame before
+        /// returning if they do not own another copy of its payload.
+        /// </summary>
+        event EventHandler<RawFrame> RawFrameGenerated;
+
         event EventHandler<RawFrame> FrameReceived;
 
         /// <summary>

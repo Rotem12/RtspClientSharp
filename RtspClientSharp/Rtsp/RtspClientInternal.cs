@@ -50,6 +50,7 @@ namespace RtspClientSharp.Rtsp
         private int _disposed;
 
         public Action<RawFrame> FrameReceived;
+        public Action<RawFrame> RawFrameGenerated;
 
         public RtspClientInternal(ConnectionParameters connectionParameters,
             Func<IRtspTransportClient> transportClientProvider = null)
@@ -349,7 +350,10 @@ namespace RtspClientSharp.Rtsp
                     // if we are connected to several networks, take local IP from already existing TCP connection
                     IPAddress localIpToServer = GetMulticastInterfaceAddress();
 
-                    IPEndPoint endPointRtp = new IPEndPoint(localIpToServer, rtpChannelNumber);
+                    IPAddress bindAddress = destinationAddress.AddressFamily == AddressFamily.InterNetwork
+                        ? IPAddress.Any
+                        : IPAddress.IPv6Any;
+                    IPEndPoint endPointRtp = new IPEndPoint(bindAddress, rtpChannelNumber);
 
                     rtpClient.Bind(endPointRtp);
                     rtpClient.JoinMulticastSourceGroup(destinationAddress, localIpToServer, sourceAddress);
@@ -357,7 +361,7 @@ namespace RtspClientSharp.Rtsp
 
                     try
                     {
-                        IPEndPoint endPointRtcp = new IPEndPoint(localIpToServer, rtcpChannelNumber);
+                        IPEndPoint endPointRtcp = new IPEndPoint(bindAddress, rtcpChannelNumber);
 
                         rtcpClient.Bind(endPointRtcp);
                         IPAddress whereToReportRtcp = rtcpClient.JoinMulticastSourceGroup(destinationAddress, localIpToServer, sourceAddress);
@@ -588,12 +592,28 @@ namespace RtspClientSharp.Rtsp
 
         private void OnFrameGeneratedLockfree(RawFrame frame)
         {
+            RaiseRawFrameGenerated(frame);
             _frameDispatcher.TryEnqueue(frame);
         }
 
         private void OnFrameGeneratedThreadSafe(RawFrame frame)
         {
+            RaiseRawFrameGenerated(frame);
             _frameDispatcher.TryEnqueue(frame);
+        }
+
+        private void RaiseRawFrameGenerated(RawFrame frame)
+        {
+            try
+            {
+                RawFrameGenerated?.Invoke(frame);
+            }
+            catch (Exception exception)
+            {
+                // Keep a recording/diagnostic tap from terminating the RTSP
+                // receive path. The subscriber is responsible for reporting it.
+                Debug.WriteLine(exception);
+            }
         }
 
         private async Task ReceiveOverTcpAsync(Stream rtspStream, CancellationToken token)

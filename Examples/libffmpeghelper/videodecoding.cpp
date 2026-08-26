@@ -29,6 +29,14 @@ struct VideoDecoderContext
 	int shader_texture_height;
 	int render_width;
 	int render_height;
+	ID3D11Texture2D *source_texture;
+	D3D11_TEXTURE2D_DESC source_texture_desc;
+	bool source_texture_desc_valid;
+	bool crop_constants_valid;
+	float crop_left;
+	float crop_top;
+	float crop_right;
+	float crop_bottom;
 };
 
 struct RenderCropConstants
@@ -139,6 +147,10 @@ static void release_render_resources(VideoDecoderContext *context)
 	context->shader_texture_height = 0;
 	context->render_width = 0;
 	context->render_height = 0;
+	context->source_texture = nullptr;
+	context->source_texture_desc = {};
+	context->source_texture_desc_valid = false;
+	context->crop_constants_valid = false;
 }
 
 static int compile_shader(const char *source, const char *entryPoint, const char *target, ID3DBlob **blob)
@@ -912,7 +924,17 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 		return -5;
 
 	D3D11_TEXTURE2D_DESC textureDesc = {};
-	texture->GetDesc(&textureDesc);
+	if (!context->source_texture_desc_valid || context->source_texture != texture)
+	{
+		texture->GetDesc(&textureDesc);
+		context->source_texture = texture;
+		context->source_texture_desc = textureDesc;
+		context->source_texture_desc_valid = true;
+	}
+	else
+	{
+		textureDesc = context->source_texture_desc;
+	}
 
 	if (textureDesc.Format != DXGI_FORMAT_NV12 &&
 		textureDesc.Format != DXGI_FORMAT_P010 &&
@@ -928,15 +950,30 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 
 	ID3D11ShaderResourceView *views[2] = { context->shader_resource_view_y, context->shader_resource_view_uv };
 
-	D3D11_MAPPED_SUBRESOURCE mapped = {};
-	if (SUCCEEDED(immediateContext->Map(context->crop_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+	const float nextCropLeft = static_cast<float>(cropLeft);
+	const float nextCropTop = static_cast<float>(cropTop);
+	const float nextCropRight = static_cast<float>(cropRight);
+	const float nextCropBottom = static_cast<float>(cropBottom);
+	if (!context->crop_constants_valid || context->crop_left != nextCropLeft ||
+		context->crop_top != nextCropTop || context->crop_right != nextCropRight ||
+		context->crop_bottom != nextCropBottom)
 	{
-		auto constants = static_cast<RenderCropConstants *>(mapped.pData);
-		constants->crop_left = static_cast<float>(cropLeft);
-		constants->crop_top = static_cast<float>(cropTop);
-		constants->crop_right = static_cast<float>(cropRight);
-		constants->crop_bottom = static_cast<float>(cropBottom);
-		immediateContext->Unmap(context->crop_buffer, 0);
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		if (SUCCEEDED(immediateContext->Map(context->crop_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+		{
+			auto constants = static_cast<RenderCropConstants *>(mapped.pData);
+			constants->crop_left = nextCropLeft;
+			constants->crop_top = nextCropTop;
+			constants->crop_right = nextCropRight;
+			constants->crop_bottom = nextCropBottom;
+			immediateContext->Unmap(context->crop_buffer, 0);
+
+			context->crop_left = nextCropLeft;
+			context->crop_top = nextCropTop;
+			context->crop_right = nextCropRight;
+			context->crop_bottom = nextCropBottom;
+			context->crop_constants_valid = true;
+		}
 	}
 
 	D3D11_VIEWPORT viewport = {};

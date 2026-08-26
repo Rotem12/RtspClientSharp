@@ -67,6 +67,22 @@ using(var rtspClient = new RtspClient(connectionParameters))
 You could find more complex samples here (e.g. simple [RTSP player](https://github.com/BogdanovKirill/RtspClientSharp/tree/master/Examples/SimpleRtspPlayer) with full frame decoding and rendering processes):
 https://github.com/BogdanovKirill/RtspClientSharp/tree/master/Examples
 
+## WinForms video control
+
+The Windows-specific `RtspClientSharp.WinForms` project provides a reusable
+`RtspVideoControl` for RTSP, direct RTP-over-UDP, and raw MPEG-TS-over-UDP.
+Use `SourceType=Auto` and `TransportMode=MediaTransportMode.Auto` to select the
+input and sniff RTP versus MPEG-TS automatically. The control uses a bounded
+latest-frame display buffer, supports software/D3D11 pipelines, and records
+H.264/H.265 directly into video-only MPEG-TS without decoding or AForge. Use an
+explicit `.h264` or `.h265` output path when a raw Annex-B elementary stream is
+required.
+
+See [the WinForms control README](RtspClientSharp.WinForms/README.md) for
+deployment and direct-RTP SPS/PPS details. The native
+`Examples/libffmpeghelper/libffmpeghelper.dll` must be deployed beside the
+application for decoding and must match its x86/x64 architecture.
+
 ## Donation
 If this project help you reduce time to develop, you can give me a cup of coffee :) 
 You could also make per-feature donations, write me to bogdanov.kv@bk.ru

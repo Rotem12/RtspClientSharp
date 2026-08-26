@@ -12,8 +12,9 @@ namespace RtspClientSharp.Utils
     {
         private const int MaxQueuedFrames = 4;
 
-        private readonly BlockingCollection<RawFrame> _queue = new BlockingCollection<RawFrame>(
-            new ConcurrentQueue<RawFrame>(), MaxQueuedFrames);
+        private readonly BlockingCollection<RawFrameCopier.RawFrameCopy> _queue =
+            new BlockingCollection<RawFrameCopier.RawFrameCopy>(
+            new ConcurrentQueue<RawFrameCopier.RawFrameCopy>(), MaxQueuedFrames);
         private readonly Action<RawFrame> _frameHandler;
         private readonly object _enqueueLock = new object();
         private readonly Task _dispatchTask;
@@ -33,8 +34,6 @@ namespace RtspClientSharp.Utils
             if (frame == null || Volatile.Read(ref _disposed) != 0)
                 return false;
 
-            RawFrame copiedFrame = RawFrameCopier.Copy(frame);
-
             lock (_enqueueLock)
             {
                 if (Volatile.Read(ref _disposed) != 0)
@@ -42,19 +41,15 @@ namespace RtspClientSharp.Utils
 
                 try
                 {
-                    if (_waitForH264IFrame && copiedFrame is RawH264Frame &&
-                        !(copiedFrame is RawH264IFrame))
+                    bool isH264Frame = frame is RawH264Frame;
+                    bool isH264IFrame = frame is RawH264IFrame;
+
+                    if (_waitForH264IFrame && isH264Frame && !isH264IFrame)
                         return false;
 
-                    if (_queue.TryAdd(copiedFrame))
-                    {
-                        if (copiedFrame is RawH264IFrame)
-                            _waitForH264IFrame = false;
-
-                        return true;
-                    }
-
-                    if (copiedFrame is RawH264Frame)
+                    // Decide whether the frame will be accepted before copying its payload. This
+                    // avoids a large memcpy for every dependent H.264 frame discarded under load.
+                    if (_queue.Count >= MaxQueuedFrames && isH264Frame)
                     {
                         // A dropped H.264 frame invalidates all dependent P-frames already
                         // queued. Flush them and wait for a fresh IDR instead of displaying
@@ -62,21 +57,30 @@ namespace RtspClientSharp.Utils
                         _waitForH264IFrame = true;
                         DrainQueue();
 
-                        if (!(copiedFrame is RawH264IFrame))
+                        if (!isH264IFrame)
                             return false;
 
                         _waitForH264IFrame = false;
-                        return _queue.TryAdd(copiedFrame);
                     }
-
-                    if (_queue.TryTake(out RawFrame droppedFrame) && droppedFrame is RawH264Frame)
+                    else if (_queue.Count >= MaxQueuedFrames &&
+                             _queue.TryTake(out RawFrameCopier.RawFrameCopy droppedFrame))
                     {
-                        _waitForH264IFrame = true;
-                        DrainQueue();
-                        return false;
+                        try
+                        {
+                            if (droppedFrame.Frame is RawH264Frame)
+                            {
+                                _waitForH264IFrame = true;
+                                DrainQueue();
+                                return false;
+                            }
+                        }
+                        finally
+                        {
+                            droppedFrame.Dispose();
+                        }
                     }
 
-                    return _queue.TryAdd(copiedFrame);
+                    return TryEnqueueCopied(frame, isH264IFrame);
                 }
                 catch (InvalidOperationException)
                 {
@@ -114,25 +118,51 @@ namespace RtspClientSharp.Utils
         {
             Volatile.Write(ref _dispatchThreadId, Thread.CurrentThread.ManagedThreadId);
 
-            foreach (RawFrame frame in _queue.GetConsumingEnumerable())
+            foreach (RawFrameCopier.RawFrameCopy copiedFrame in _queue.GetConsumingEnumerable())
             {
                 try
                 {
-                    _frameHandler(frame);
+                    _frameHandler(copiedFrame.Frame);
                 }
                 catch (Exception e)
                 {
                     // A consumer callback must not terminate the receive/dispatch pipeline.
                     Debug.WriteLine(e);
                 }
+                finally
+                {
+                    copiedFrame.Dispose();
+                }
             }
         }
 
         private void DrainQueue()
         {
-            while (_queue.TryTake(out RawFrame ignored))
+            while (_queue.TryTake(out RawFrameCopier.RawFrameCopy ignored))
+                ignored.Dispose();
+        }
+
+        private bool TryEnqueueCopied(RawFrame frame, bool isH264IFrame)
+        {
+            RawFrameCopier.RawFrameCopy copiedFrame = RawFrameCopier.Copy(frame);
+
+            try
             {
+                if (_queue.TryAdd(copiedFrame))
+                {
+                    if (isH264IFrame)
+                        _waitForH264IFrame = false;
+
+                    return true;
+                }
             }
+            catch (InvalidOperationException)
+            {
+                // CompleteAdding raced with this enqueue.
+            }
+
+            copiedFrame.Dispose();
+            return false;
         }
     }
 }
