@@ -26,12 +26,16 @@ namespace RtspClientSharp.Ts
         {
             _frameSink = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
             _tsPacketFactory = new TsPacketFactory();
-            _tsPacketFactory.TsPacketReady += OnTsPacketReady;
+            _tsPacketFactory.SynchronousPacketReady = ProcessTsPacket;
         }
 
         public void Process(ArraySegment<byte> payloadSegment)
         {
-            _tsPacketFactory.PushData(payloadSegment);
+            // TS packets are consumed synchronously by OnTsPacketReady. Use the
+            // factory's pooled path so each UDP datagram does not allocate a
+            // managed payload array per TS packet or an EventArgs object per
+            // callback.
+            _tsPacketFactory.PushDataPooled(payloadSegment);
         }
 
         public void ResetState()
@@ -44,23 +48,23 @@ namespace RtspClientSharp.Ts
                 stream.Reset();
         }
 
-        private void OnTsPacketReady(object sender, TsPacketReadyEventArgs args)
+        private void ProcessTsPacket(TsPacket packet)
         {
-            TsPacket packet = args.TsPacket;
+            ArraySegment<byte> payload = packet.GetPayloadSegment();
             PacketsReceivedSinceLastReset++;
 
-            if (!packet.ContainsPayload || packet.Payload == null || packet.PayloadLen <= 0)
+            if (!packet.ContainsPayload || payload.Array == null || packet.PayloadLen <= 0)
                 return;
 
             if (packet.Pid == (ushort)PidType.PatPid)
             {
-                ParsePat(packet);
+                ParsePat(packet, payload);
                 return;
             }
 
             if (_pmtPid != 0 && packet.Pid == _pmtPid)
             {
-                ParsePmt(packet);
+                ParsePmt(packet, payload);
                 return;
             }
 
@@ -82,42 +86,52 @@ namespace RtspClientSharp.Ts
                 currentPes.Add(packet);
         }
 
-        private void ParsePat(TsPacket packet)
+        private void ParsePat(TsPacket packet, ArraySegment<byte> payload)
         {
-            int payloadStart = GetPsiPayloadStart(packet);
-            if (payloadStart < 0 || payloadStart + 8 > packet.PayloadLen)
+            int payloadStart = GetPsiPayloadStart(packet.PayloadUnitStartIndicator, payload);
+            if (payloadStart < 0 || payloadStart + 8 > payload.Count)
                 return;
 
-            int sectionLength = ((packet.Payload[payloadStart + 1] & 0x0F) << 8) | packet.Payload[payloadStart + 2];
-            int sectionEnd = Math.Min(packet.PayloadLen, payloadStart + 3 + sectionLength - 4);
+            byte[] buffer = payload.Array;
+            int offset = payload.Offset;
+            int sectionLength = ((buffer[offset + payloadStart + 1] & 0x0F) << 8) |
+                                buffer[offset + payloadStart + 2];
+            int sectionEnd = Math.Min(payload.Count, payloadStart + 3 + sectionLength - 4);
 
             for (int i = payloadStart + 8; i + 3 < sectionEnd; i += 4)
             {
-                int programNumber = (packet.Payload[i] << 8) | packet.Payload[i + 1];
+                int programNumber = (buffer[offset + i] << 8) | buffer[offset + i + 1];
                 if (programNumber == 0)
                     continue;
 
-                _pmtPid = (ushort)(((packet.Payload[i + 2] & 0x1F) << 8) | packet.Payload[i + 3]);
+                _pmtPid = (ushort)(((buffer[offset + i + 2] & 0x1F) << 8) |
+                                   buffer[offset + i + 3]);
                 return;
             }
         }
 
-        private void ParsePmt(TsPacket packet)
+        private void ParsePmt(TsPacket packet, ArraySegment<byte> payload)
         {
-            int payloadStart = GetPsiPayloadStart(packet);
-            if (payloadStart < 0 || payloadStart + 12 > packet.PayloadLen)
+            int payloadStart = GetPsiPayloadStart(packet.PayloadUnitStartIndicator, payload);
+            if (payloadStart < 0 || payloadStart + 12 > payload.Count)
                 return;
 
-            int sectionLength = ((packet.Payload[payloadStart + 1] & 0x0F) << 8) | packet.Payload[payloadStart + 2];
-            int sectionEnd = Math.Min(packet.PayloadLen, payloadStart + 3 + sectionLength - 4);
-            int programInfoLength = ((packet.Payload[payloadStart + 10] & 0x0F) << 8) | packet.Payload[payloadStart + 11];
+            byte[] buffer = payload.Array;
+            int offset = payload.Offset;
+            int sectionLength = ((buffer[offset + payloadStart + 1] & 0x0F) << 8) |
+                                buffer[offset + payloadStart + 2];
+            int sectionEnd = Math.Min(payload.Count, payloadStart + 3 + sectionLength - 4);
+            int programInfoLength = ((buffer[offset + payloadStart + 10] & 0x0F) << 8) |
+                                    buffer[offset + payloadStart + 11];
             int streamIndex = payloadStart + 12 + programInfoLength;
 
             while (streamIndex + 4 < sectionEnd)
             {
-                byte streamType = packet.Payload[streamIndex];
-                ushort elementaryPid = (ushort)(((packet.Payload[streamIndex + 1] & 0x1F) << 8) | packet.Payload[streamIndex + 2]);
-                int esInfoLength = ((packet.Payload[streamIndex + 3] & 0x0F) << 8) | packet.Payload[streamIndex + 4];
+                byte streamType = buffer[offset + streamIndex];
+                ushort elementaryPid = (ushort)(((buffer[offset + streamIndex + 1] & 0x1F) << 8) |
+                                                buffer[offset + streamIndex + 2]);
+                int esInfoLength = ((buffer[offset + streamIndex + 3] & 0x0F) << 8) |
+                                   buffer[offset + streamIndex + 4];
 
                 ElementaryStream stream = CreateElementaryStream(streamType);
                 if (stream != null)
@@ -133,19 +147,20 @@ namespace RtspClientSharp.Ts
             }
         }
 
-        private static int GetPsiPayloadStart(TsPacket packet)
+        private static int GetPsiPayloadStart(bool payloadUnitStartIndicator,
+            ArraySegment<byte> payload)
         {
             int payloadStart = 0;
 
-            if (packet.PayloadUnitStartIndicator)
+            if (payloadUnitStartIndicator)
             {
-                if (packet.PayloadLen == 0)
+                if (payload.Count == 0)
                     return -1;
 
-                payloadStart = packet.Payload[0] + 1;
+                payloadStart = payload.Array[payload.Offset] + 1;
             }
 
-            return payloadStart < packet.PayloadLen ? payloadStart : -1;
+            return payloadStart < payload.Count ? payloadStart : -1;
         }
 
         private ElementaryStream CreateElementaryStream(byte streamType)

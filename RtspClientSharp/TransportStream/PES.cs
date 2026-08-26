@@ -75,15 +75,18 @@ namespace RtspClientSharp.Ts
             DTS = TimeSpan.MinValue;
             PTS = TimeSpan.MinValue;
 
-            if (packet.Payload == null || packet.PayloadLen < 6)
+            ArraySegment<byte> payload = packet.GetPayloadSegment();
+            if (payload.Array == null || payload.Count < 6)
             {
                 Dropped = true;
                 return;
             }
 
-            PacketStartCodePrefix = (uint)((packet.Payload[0] << 16) + (packet.Payload[1] << 8) + packet.Payload[2]);
-            StreamId = packet.Payload[3];
-            PesPacketLength = (ushort)((packet.Payload[4] << 8) + packet.Payload[5]);
+            byte[] buffer = payload.Array;
+            int offset = payload.Offset;
+            PacketStartCodePrefix = (uint)((buffer[offset] << 16) + (buffer[offset + 1] << 8) + buffer[offset + 2]);
+            StreamId = buffer[offset + 3];
+            PesPacketLength = (ushort)((buffer[offset + 4] << 8) + buffer[offset + 5]);
 
             if (PacketStartCodePrefix != DefaultPacketStartCodePrefix)
             {
@@ -99,7 +102,7 @@ namespace RtspClientSharp.Ts
 
             int initialCapacity = PesPacketLength > 0 ? PesPacketLength + 6 : Math.Max(packet.PayloadLen, 64 * 1024);
             _data = new byte[initialCapacity];
-            AddPayload(packet.Payload, packet.PayloadLen);
+            AddPayload(buffer, offset, payload.Count);
         }
 
         public bool HasAllBytes()
@@ -112,12 +115,13 @@ namespace RtspClientSharp.Ts
 
         public bool Add(TsPacket packet)
         {
-            if (packet.PayloadUnitStartIndicator || _data == null || packet.Payload == null || packet.PayloadLen <= 0)
+            ArraySegment<byte> payload = packet.GetPayloadSegment();
+            if (packet.PayloadUnitStartIndicator || _data == null || payload.Array == null || payload.Count <= 0)
                 return false;
 
             if (PesPacketLength == 0)
             {
-                AddPayload(packet.Payload, packet.PayloadLen);
+                AddPayload(payload.Array, payload.Offset, payload.Count);
                 return true;
             }
 
@@ -125,7 +129,7 @@ namespace RtspClientSharp.Ts
             if (bytesRemaining <= 0)
                 return true;
 
-            AddPayload(packet.Payload, Math.Min(packet.PayloadLen, bytesRemaining));
+            AddPayload(payload.Array, payload.Offset, Math.Min(payload.Count, bytesRemaining));
             return true;
         }
 
@@ -208,13 +212,13 @@ namespace RtspClientSharp.Ts
             }
         }
 
-        private void AddPayload(byte[] payload, int payloadLength)
+        private void AddPayload(byte[] payload, int payloadOffset, int payloadLength)
         {
             if (payload == null || payloadLength <= 0)
                 return;
 
             EnsureCapacity(_pesBytes + payloadLength);
-            Buffer.BlockCopy(payload, 0, _data, _pesBytes, payloadLength);
+            Buffer.BlockCopy(payload, payloadOffset, _data, _pesBytes, payloadLength);
             _pesBytes += payloadLength;
         }
 

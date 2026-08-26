@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -58,6 +59,8 @@ namespace RtspClientSharp.WinForms
         private long _receivedVideoFrameCount;
         private long _nativeDecodedFrameCount;
         private long _gpuRenderedFrameCount;
+        private long _gpuSkippedFrameCount;
+        private long _lastGpuRenderTimestamp;
         private long _decodeFailureCount;
         private long _decodedFrameCount;
         private long _droppedFrameCount;
@@ -74,6 +77,7 @@ namespace RtspClientSharp.WinForms
         private ICompressedVideoRecorder _compressedRecorder;
         private BitmapVideoRollingBuffer _bitmapPreRecord;
         private IBitmapVideoRecorder _bitmapRecorder;
+        private int _compressedRecordingNeeded;
         private bool _bitmapRecordingRequested;
         private string _bitmapRecordingPath;
         private DateTime? _bitmapRecordingFirstTimestamp;
@@ -259,6 +263,8 @@ namespace RtspClientSharp.WinForms
         public long NativeDecodedFrameCount => Interlocked.Read(ref _nativeDecodedFrameCount);
         /// <summary>Number of frames successfully submitted to the native D3D11 renderer.</summary>
         public long GpuRenderedFrameCount => Interlocked.Read(ref _gpuRenderedFrameCount);
+        /// <summary>Number of successfully decoded GPU frames skipped by RenderIntervalMs pacing.</summary>
+        public long GpuSkippedFrameCount => Interlocked.Read(ref _gpuSkippedFrameCount);
         /// <summary>Number of native decode calls that did not produce a frame.</summary>
         public long DecodeFailureCount => Interlocked.Read(ref _decodeFailureCount);
         /// <summary>
@@ -299,6 +305,8 @@ namespace RtspClientSharp.WinForms
             Interlocked.Exchange(ref _receivedVideoFrameCount, 0);
             Interlocked.Exchange(ref _nativeDecodedFrameCount, 0);
             Interlocked.Exchange(ref _gpuRenderedFrameCount, 0);
+            Interlocked.Exchange(ref _gpuSkippedFrameCount, 0);
+            Interlocked.Exchange(ref _lastGpuRenderTimestamp, 0);
             Interlocked.Exchange(ref _decodeFailureCount, 0);
             Interlocked.Exchange(ref _decodedFrameCount, 0);
             Interlocked.Exchange(ref _droppedFrameCount, 0);
@@ -334,6 +342,7 @@ namespace RtspClientSharp.WinForms
                                    recordingMode == VideoRecordingMode.BitmapFallback
                     ? new BitmapVideoRollingBuffer(TimeSpan.FromSeconds(PreRecordSeconds))
                     : null;
+                Volatile.Write(ref _compressedRecordingNeeded, _compressedPreRecord != null ? 1 : 0);
             }
 
             IRawFrameSource source = CreateRawFrameSource(connectionParameters);
@@ -386,6 +395,7 @@ namespace RtspClientSharp.WinForms
             {
                 _compressedPreRecord?.Clear();
                 _compressedPreRecord = null;
+                Volatile.Write(ref _compressedRecordingNeeded, 0);
                 _bitmapPreRecord?.Clear();
                 _bitmapPreRecord = null;
             }
@@ -457,6 +467,7 @@ namespace RtspClientSharp.WinForms
 
                 recorder.Start(outputFilePath, preRecordFrames, effectiveOptions);
                 _compressedRecorder = recorder;
+                Volatile.Write(ref _compressedRecordingNeeded, 1);
                 LastRecordingStatus = preRecordFrames == null
                     ? "Compressed recording waiting for first keyframe"
                     : $"Compressed recording started with {preRecordFrames.Count} pre-record frames";
@@ -474,6 +485,7 @@ namespace RtspClientSharp.WinForms
                     string outputPath = recorder.OutputFilePath;
                     recorder.Stop();
                     recorder.Dispose();
+                    Volatile.Write(ref _compressedRecordingNeeded, _compressedPreRecord != null ? 1 : 0);
                     LastRecordingStatus = outputPath == null
                         ? "Compressed recording stopped before first keyframe"
                         : $"Compressed recording stopped: {outputPath}";
@@ -723,11 +735,8 @@ namespace RtspClientSharp.WinForms
             if (!IsPlaying || !ReferenceEquals(sender, _rawFrameSource) || rawFrame == null)
                 return;
 
-            if (sender is IRawFrameSource source)
-            {
-                DetectedTransportMode = source.DetectedTransportMode;
-                CaptureTransportMetrics(source);
-            }
+            if (Volatile.Read(ref _compressedRecordingNeeded) == 0)
+                return;
 
             try
             {
@@ -749,10 +758,7 @@ namespace RtspClientSharp.WinForms
                 return;
 
             if (sender is IRawFrameSource source)
-            {
                 DetectedTransportMode = source.DetectedTransportMode;
-                CaptureTransportMetrics(source);
-            }
 
             if (rawFrame == null)
                 return;
@@ -839,9 +845,16 @@ namespace RtspClientSharp.WinForms
                         Interlocked.Increment(ref _nativeDecodedFrameCount);
                         Interlocked.Increment(ref _decodedFrameCount);
                         SetDecoderStatus($"{codecId}: D3D11 end-to-end GPU render active");
-                        decoder.RenderGpuFrame(ClampCrop(DrawLeft), ClampCrop(DrawUp),
-                            ClampCrop(DrawRight), ClampCrop(DrawDown));
-                        Interlocked.Increment(ref _gpuRenderedFrameCount);
+                        if (ShouldRenderGpuFrame())
+                        {
+                            decoder.RenderGpuFrame(ClampCrop(DrawLeft), ClampCrop(DrawUp),
+                                ClampCrop(DrawRight), ClampCrop(DrawDown));
+                            Interlocked.Increment(ref _gpuRenderedFrameCount);
+                        }
+                        else
+                        {
+                            Interlocked.Increment(ref _gpuSkippedFrameCount);
+                        }
                         Volatile.Write(ref _endToEndGpuActive, 1);
                         decodedEvent = new VideoFrameEventArgs(rawVideoFrame.Timestamp, parameters.Width,
                             parameters.Height, decoder.IsHardwareAccelerated, DetectedTransportMode);
@@ -871,6 +884,20 @@ namespace RtspClientSharp.WinForms
 
             if (decodedEvent != null)
                 FrameDecoded?.Invoke(this, decodedEvent);
+            return true;
+        }
+
+        private bool ShouldRenderGpuFrame()
+        {
+            long now = Stopwatch.GetTimestamp();
+            long last = Volatile.Read(ref _lastGpuRenderTimestamp);
+            int intervalMs = Volatile.Read(ref _renderIntervalMs);
+            long intervalTicks = (long)(intervalMs * (double)Stopwatch.Frequency / 1000.0);
+
+            if (last != 0 && now - last < intervalTicks)
+                return false;
+
+            Volatile.Write(ref _lastGpuRenderTimestamp, now);
             return true;
         }
 
@@ -1071,6 +1098,9 @@ namespace RtspClientSharp.WinForms
 
         private void RecordCompressedFrame(RawFrame rawFrame)
         {
+            if (Volatile.Read(ref _compressedRecordingNeeded) == 0)
+                return;
+
             lock (_recordingSyncRoot)
             {
                 if (_compressedPreRecord == null && _compressedRecorder == null)

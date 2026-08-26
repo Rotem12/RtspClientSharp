@@ -193,6 +193,9 @@ namespace RtspClientSharp.WinForms
             if (sender is IRawFrameClient client)
             {
                 Volatile.Write(ref _detectedTransportMode, (int)client.DetectedTransportMode);
+                // RTSP ReceiveAsync owns a long-running read loop, so it may not
+                // return to ReceiveLoopAsync between frames. Keep the source
+                // counters current here for live diagnostics.
                 UpdateTransportMetrics(client);
             }
             FrameReceived?.Invoke(this, rawFrame);

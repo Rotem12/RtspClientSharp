@@ -13,6 +13,8 @@
   limitations under the License.
 */
 
+using System;
+
 namespace RtspClientSharp.Ts
 {
 
@@ -30,10 +32,22 @@ namespace RtspClientSharp.Ts
         public PesHdr PesHeader;
         public byte[] Payload;
         public int PayloadLen; //length of valid data within Payload field (source data array may be oversized if rented)
+        // The built-in TS stream can borrow a payload directly from the current
+        // transport datagram. Public callers continue to receive Payload arrays;
+        // this segment is only valid during synchronous packet delivery.
+        internal ArraySegment<byte> PayloadSegment;
         public AdaptationField AdaptationField;
         public byte[] SourceData; //original data used to construct packet (if chosen to retain)
         public int SourceDataLen; //length of valid data within SourceData field (source data array may be oversized if rented)
         public int SourceBufferIndex; //index into original data buffer used to construct packet
+
+        internal ArraySegment<byte> GetPayloadSegment()
+        {
+            if (Payload != null)
+                return new ArraySegment<byte>(Payload, 0, PayloadLen);
+
+            return PayloadSegment;
+        }
     }
 
 

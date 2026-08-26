@@ -19,7 +19,6 @@ namespace RtspClientSharp.RtpClient
     public sealed class RtpClient : IRtpClient
     {
         private const int UdpSocketReceiveBufferSize = 512 * 1024;
-        private bool _anyFrameReceived;
         private UdpClient _rtpClient;
         private int _disposed;
         private long _receivedDatagramCount;
@@ -64,7 +63,6 @@ namespace RtspClientSharp.RtpClient
 
             RawFrameReceived = frame =>
             {
-                Volatile.Write(ref _anyFrameReceived, true);
                 FrameReceived?.Invoke(this, frame);
             };
 
@@ -204,44 +202,32 @@ namespace RtspClientSharp.RtpClient
                     return;
                 }
 
-                var delayTaskCancelTokenSource = new CancellationTokenSource();
-                using (var linkedTokenSource =
-                    CancellationTokenSource.CreateLinkedTokenSource(delayTaskCancelTokenSource.Token, token))
+                // ReceiveRtpFromUdpAsync reads exactly one datagram. The old loop
+                // recreated two cancellation sources and a linked timeout task for
+                // every packet, even though no second receive could complete while
+                // this task was pending. One timeout task is sufficient and keeps
+                // the hot receive path allocation-light.
+                using (var timeoutCancellation = CancellationTokenSource.CreateLinkedTokenSource(token))
                 {
-                    CancellationToken delayTaskToken = linkedTokenSource.Token;
+                    Task timeoutTask = Task.Delay(Timeout, timeoutCancellation.Token);
+                    Task result = await Task.WhenAny(receiveInternalTask, timeoutTask).ConfigureAwait(false);
 
-                    while (true)
+                    if (result == receiveInternalTask)
                     {
-                        _anyFrameReceived = false;
-
-                        Task result = await Task.WhenAny(receiveInternalTask,
-                            Task.Delay(Timeout, delayTaskToken)).ConfigureAwait(false);
-
-                        if (result == receiveInternalTask)
-                        {
-                            delayTaskCancelTokenSource.Cancel();
-                            await receiveInternalTask;
-                            break;
-                        }
-
-                        if (result.IsCanceled)
-                        {
-                            TimeSpan cancelTimeout = new TimeSpan(0, 0, 0, 0, Timeout);
-                            if (cancelTimeout == TimeSpan.Zero ||
-                                await Task.WhenAny(receiveInternalTask,
-                                    Task.Delay(cancelTimeout, CancellationToken.None)) != receiveInternalTask)
-                                _rtpClient.Dispose();
-
-                            await Task.WhenAny(receiveInternalTask);
-                            throw new OperationCanceledException();
-                        }
-
-                        if (!Volatile.Read(ref _anyFrameReceived))
-                        {
-                            receiveInternalTask.IgnoreExceptions();
-                            throw new RtspClientException("Receive timeout", new TimeoutException());
-                        }
+                        timeoutCancellation.Cancel();
+                        await receiveInternalTask;
+                        return;
                     }
+
+                    if (timeoutTask.IsCanceled)
+                    {
+                        _rtpClient.Dispose();
+                        await Task.WhenAny(receiveInternalTask);
+                        throw new OperationCanceledException(token);
+                    }
+
+                    receiveInternalTask.IgnoreExceptions();
+                    throw new RtspClientException("Receive timeout", new TimeoutException());
                 }
             }
             catch (InvalidOperationException)
@@ -366,7 +352,6 @@ namespace RtspClientSharp.RtpClient
 
             // Copy and dispatch outside the receive thread. FrameSegment points into parser
             // storage that is reused for the next frame, so the dispatcher owns the copy.
-            Volatile.Write(ref _anyFrameReceived, true);
             RaiseRawFrameGenerated(frame);
             if (!_frameDispatcher.TryEnqueue(frame))
                 Interlocked.Increment(ref _dispatcherDroppedFrameCount);

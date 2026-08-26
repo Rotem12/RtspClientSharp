@@ -39,6 +39,28 @@ namespace RtspClientSharp.UnitTests.Ts
         }
 
         [TestMethod]
+        public void Process_H264TransportStreamSplitAcrossDatagrams_GeneratesVideoFrame()
+        {
+            var frames = new List<RawFrame>();
+            var stream = new TsStream(new CapturingParser { FrameGenerated = frames.Add });
+
+            byte[] spsBytes = Convert.FromBase64String("AAAAAWdNQCmaZgUB7YC1AQEBBenA");
+            byte[] ppsBytes = Convert.FromBase64String("AAAAAWjuPIA=");
+            byte[] iFrameBytes = { 0x0, 0x0, 0x0, 0x1, 0x65, 0x88, 0x80, 0x10, 0x00 };
+            byte[] accessUnit = spsBytes.Concat(ppsBytes).Concat(iFrameBytes).ToArray();
+            byte[][] packets = BuildProgramPackets(0x1B, 0x0101, 0xE0, accessUnit);
+            byte[] buffer = packets.SelectMany(packet => packet).ToArray();
+
+            stream.Process(new ArraySegment<byte>(buffer, 0, 100));
+            stream.Process(new ArraySegment<byte>(buffer, 100, buffer.Length - 100));
+
+            Assert.AreEqual(packets.Length, stream.PacketsReceivedSinceLastReset);
+            Assert.AreEqual(1, frames.Count);
+            Assert.IsInstanceOfType(frames[0], typeof(RawH264IFrame));
+            Assert.IsTrue(frames[0].FrameSegment.SequenceEqual(iFrameBytes));
+        }
+
+        [TestMethod]
         public void Process_AacTransportStream_GeneratesAudioFrame()
         {
             var frames = new List<RawFrame>();

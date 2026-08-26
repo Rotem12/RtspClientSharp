@@ -72,6 +72,7 @@ counters (`TransportDatagramCount`, `TransportFrameCount`,
 `TransportDroppedFrameCount`, `ReceivedVideoFrameCount`,
 `NativeDecodedFrameCount`, `DecodedFrameCount`, `DroppedFrameCount`, and
 `PresentedFrameCount`, plus `IsHardwareDecodeActive`, `IsEndToEndGpuActive`,
-and `GpuRenderedFrameCount`) can be used to separate socket/parser delivery,
-dispatcher loss, decoder failure, GPU presentation, and intentional display
-throttling.
+`GpuRenderedFrameCount`, and `GpuSkippedFrameCount`) can be used to separate
+socket/parser delivery, dispatcher loss, decoder failure, GPU presentation,
+and intentional display throttling. GPU rendering honors `RenderIntervalMs`;
+decoded frames skipped by that pacing are counted by `GpuSkippedFrameCount`.
