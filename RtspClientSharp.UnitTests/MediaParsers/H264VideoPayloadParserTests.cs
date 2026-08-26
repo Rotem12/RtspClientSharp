@@ -40,6 +40,41 @@ namespace RtspClientSharp.UnitTests.MediaParsers
             new H264VideoPayloadParser(testCodecInfo);
         }
 
+        [TestMethod]
+        public void Parse_SinglePacketFuThenFragmentedFu_DoesNotReusePreviousNalBytes()
+        {
+            H264CodecInfo testCodecInfo = CreateTestH264CodecInfo();
+            RawH264Frame frame = null;
+
+            var parser = new H264VideoPayloadParser(testCodecInfo)
+            {
+                FrameGenerated = rawFrame => frame = (RawH264Frame)rawFrame
+            };
+
+            // The first FU is complete in one packet. The second FU is split across
+            // packets; its output must not contain the first FU's bytes.
+            parser.Parse(TimeSpan.Zero, new ArraySegment<byte>(new byte[]
+                {0x7C, 0xC5, 0x88, 0x80, 0x10, 0x00}), true);
+            Assert.IsInstanceOfType(frame, typeof(RawH264IFrame));
+
+            parser.Parse(TimeSpan.Zero, new ArraySegment<byte>(new byte[]
+                {0x7C, 0x81, 0x9A, 0x01}), false);
+            parser.Parse(TimeSpan.Zero, new ArraySegment<byte>(new byte[]
+                {0x7C, 0x41, 0x01, 0x64}), true);
+
+            Assert.IsInstanceOfType(frame, typeof(RawH264PFrame));
+            Assert.IsTrue(frame.FrameSegment.SequenceEqual(new byte[]
+                {0x0, 0x0, 0x0, 0x1, 0x61, 0x9A, 0x01, 0x01, 0x64}));
+        }
+
+        [TestMethod]
+        public void Parse_TruncatedStap_DropsPacketWithoutThrowing()
+        {
+            var parser = new H264VideoPayloadParser(CreateTestH264CodecInfo());
+
+            parser.Parse(TimeSpan.Zero, new ArraySegment<byte>(new byte[] {0x18, 0x00, 0x05, 0x65}), true);
+        }
+
         private static H264CodecInfo CreateTestH264CodecInfo()
         {
             var testCodecInfo = new H264CodecInfo();

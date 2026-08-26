@@ -29,5 +29,20 @@ namespace RtspClientSharp.UnitTests
             Assert.AreEqual("admin", conParams.Credentials.UserName);
             Assert.AreEqual("123456", conParams.Credentials.Password);
         }
+
+        [TestMethod]
+        public void ConnectionParameters_DefaultsToAutomaticMediaTransportDetection()
+        {
+            var conParams = new ConnectionParameters(new Uri("rtp://127.0.0.1:5004"));
+
+            Assert.AreEqual(MediaTransportMode.Auto, conParams.TransportMode);
+            Assert.IsFalse(conParams.UseTS);
+
+            conParams.UseTS = true;
+            Assert.AreEqual(MediaTransportMode.MpegTs, conParams.TransportMode);
+
+            conParams.UseTS = false;
+            Assert.AreEqual(MediaTransportMode.Rtp, conParams.TransportMode);
+        }
     }
 }

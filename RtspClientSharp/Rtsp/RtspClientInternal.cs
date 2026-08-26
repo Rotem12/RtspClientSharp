@@ -39,7 +39,7 @@ namespace RtspClientSharp.Rtsp
 
         private TpktStream _tpktStream;
 
-        private readonly SimpleHybridLock _hybridLock = new SimpleHybridLock();
+        private readonly RawFrameDispatcher _frameDispatcher;
         private readonly Random _random = RandomGeneratorFactory.CreateGenerator();
         private IRtspTransportClient _rtspTransportClient;
 
@@ -60,6 +60,7 @@ namespace RtspClientSharp.Rtsp
 
             Uri fixedRtspUri = connectionParameters.GetFixedRtspUri();
             _requestMessageFactory = new RtspRequestMessageFactory(fixedRtspUri, connectionParameters.UserAgent);
+            _frameDispatcher = new RawFrameDispatcher(frame => FrameReceived?.Invoke(frame));
         }
 
         public async Task ConnectAsync(CancellationToken token)
@@ -149,6 +150,8 @@ namespace RtspClientSharp.Rtsp
         {
             if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
                 return;
+
+            _frameDispatcher.Dispose();
 
             if (_udpClientsMap.Count != 0)
                 foreach (Socket client in _udpClientsMap.Values)
@@ -585,24 +588,12 @@ namespace RtspClientSharp.Rtsp
 
         private void OnFrameGeneratedLockfree(RawFrame frame)
         {
-            FrameReceived?.Invoke(frame);
+            _frameDispatcher.TryEnqueue(frame);
         }
 
         private void OnFrameGeneratedThreadSafe(RawFrame frame)
         {
-            if (FrameReceived == null)
-                return;
-
-            _hybridLock.Enter();
-
-            try
-            {
-                FrameReceived.Invoke(frame);
-            }
-            finally
-            {
-                _hybridLock.Leave();
-            }
+            _frameDispatcher.TryEnqueue(frame);
         }
 
         private async Task ReceiveOverTcpAsync(Stream rtspStream, CancellationToken token)

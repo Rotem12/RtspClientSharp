@@ -27,9 +27,14 @@ namespace RtspClientSharp.RtpClient
         public event Action<RawFrame> RawFrameReceived;
         public event EventHandler<RawFrame> FrameReceived;
         public bool IsH264 { get; set; } = true;
+        /// <summary>
+        /// Optional Annex-B SPS/PPS bytes for a direct RTP H.264 stream. Direct RTP has no
+        /// SDP exchange, so this must be supplied when the sender does not repeat them in-band.
+        /// </summary>
+        public byte[] H264SpsPpsBytes { get; set; } = Array.Empty<byte>();
 
         private ITransportStream stream;
-        private readonly SimpleHybridLock _hybridLock = new SimpleHybridLock();
+        private readonly RawFrameDispatcher _frameDispatcher;
 
         public RtpClient(ConnectionParameters connectionParameters)
         {
@@ -41,6 +46,8 @@ namespace RtspClientSharp.RtpClient
                 Volatile.Write(ref _anyFrameReceived, true);
                 FrameReceived?.Invoke(this, frame);
             };
+
+            _frameDispatcher = new RawFrameDispatcher(frame => RawFrameReceived?.Invoke(frame));
         }
 
         ~RtpClient()
@@ -116,7 +123,10 @@ namespace RtspClientSharp.RtpClient
             Codecs.CodecInfo info;
             if (IsH264)
             {
-                info = new Codecs.Video.H264CodecInfo();
+                info = new Codecs.Video.H264CodecInfo
+                {
+                    SpsPpsBytes = H264SpsPpsBytes ?? Array.Empty<byte>()
+                };
             }
             else
             {
@@ -125,27 +135,16 @@ namespace RtspClientSharp.RtpClient
 
             IMediaPayloadParser mediaPayloadParser = MediaPayloadParser.CreateFrom(info);
 
-            IRtpSequenceAssembler rtpSequenceAssembler;
-
-            ///      if (_connectionParameters.RtpTransport == RtpTransportProtocol.TCP)
-            //      {
-            //          rtpSequenceAssembler = null;
-            //          mediaPayloadParser.FrameGenerated = OnFrameGeneratedLockfree;
-            //      }
-            //      else
-            //      {
-            rtpSequenceAssembler = new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256);
+            IRtpSequenceAssembler rtpSequenceAssembler =
+                new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256);
             mediaPayloadParser.FrameGenerated = OnFrameGeneratedThreadSafe;
-            //       }
 
-            if(ConnectionParameters.UseTS)
-            {
-                stream = new TsStream(mediaPayloadParser);
-            }
-            else
-            {
-                stream = new RtpStream(mediaPayloadParser, 90000, rtpSequenceAssembler);
-            }
+            Func<ITransportStream> rtpStreamFactory = () =>
+                new RtpStream(mediaPayloadParser, 90000, rtpSequenceAssembler);
+            Func<ITransportStream> mpegTsStreamFactory = () => new TsStream(mediaPayloadParser);
+
+            stream = new AutoDetectingTransportStream(ConnectionParameters.TransportMode,
+                rtpStreamFactory, mpegTsStreamFactory);
         }
 
         private async Task ReceiveRtpFromUdpAsync()
@@ -244,6 +243,7 @@ namespace RtspClientSharp.RtpClient
             if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
                 return;
 
+            _frameDispatcher.Dispose();
             _rtpClient?.Dispose();
 
             GC.SuppressFinalize(this);
@@ -331,16 +331,10 @@ namespace RtspClientSharp.RtpClient
             if (RawFrameReceived == null)
                 return;
 
-            _hybridLock.Enter();
-
-            try
-            {
-                RawFrameReceived.Invoke(frame);
-            }
-            finally
-            {
-                _hybridLock.Leave();
-            }
+            // Copy and dispatch outside the receive thread. FrameSegment points into parser
+            // storage that is reused for the next frame, so the dispatcher owns the copy.
+            Volatile.Write(ref _anyFrameReceived, true);
+            _frameDispatcher.TryEnqueue(frame);
         }
 
         static bool IsMulticast(IPAddress ip)

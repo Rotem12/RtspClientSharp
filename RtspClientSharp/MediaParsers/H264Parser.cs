@@ -43,8 +43,7 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
-            if (ArrayUtils.StartsWith(byteSegment.Array, byteSegment.Offset, byteSegment.Count,
-                RawH264Frame.StartMarker))
+            if (H264Slicer.StartsWithStartMarker(byteSegment))
                 H264Slicer.Slice(byteSegment, SlicerOnNalUnitFound);
             else
                 ProcessNalUnit(byteSegment, false, ref generateFrame);
@@ -98,8 +97,9 @@ namespace RtspClientSharp.MediaParsers
         public void ResetState()
         {
             _frameStream.Position = 0;
+            _frameStream.SetLength(0);
             _sliceType = -1;
-    //        _waitForIFrame = false;
+            _waitForIFrame = true;
         }
 
         private void SlicerOnNalUnitFound(ArraySegment<byte> byteSegment)
@@ -112,33 +112,42 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
+            if (byteSegment.Array == null)
+                return;
+
             int offset = byteSegment.Offset;
 
-            if (hasStartMarker)
-                offset += RawH264Frame.StartMarker.Length;
+            int startMarkerLength = hasStartMarker ? GetStartMarkerLength(byteSegment) : 0;
+
+            if (hasStartMarker && startMarkerLength == 0)
+                return;
+
+            offset += startMarkerLength;
+
+            if (offset < byteSegment.Offset || offset >= byteSegment.Offset + byteSegment.Count)
+                return;
 
             int nalUnitType = byteSegment.Array[offset] & 0x1F;
-            bool nri = ((byteSegment.Array[offset] >> 5) & 3) == 0;
 
             if (!(nalUnitType > 0 && nalUnitType < 24))
                 throw new H264ParserException($"Invalid nal unit type: {nalUnitType}");
 
             if (nalUnitType == 7)
             {
-                ParseSps(byteSegment, hasStartMarker);
+                ParseSps(byteSegment, startMarkerLength);
                 return;
             }
 
             if (nalUnitType == 8)
             {
-                ParsePps(byteSegment, hasStartMarker);
+                ParsePps(byteSegment, startMarkerLength);
                 return;
             }
 
             if (_sliceType == -1 && (nalUnitType == 5 || nalUnitType == 1))
-                _sliceType = GetSliceType(byteSegment, hasStartMarker);
+                _sliceType = GetSliceType(byteSegment, startMarkerLength);
 
-            if (nri || nalUnitType == 6)
+            if (nalUnitType == 6)
                 return;
 
             if (generateFrame && (hasStartMarker || byteSegment.Offset >= StartMarkerSegment.Count) && _frameStream.Position == 0)
@@ -165,40 +174,38 @@ namespace RtspClientSharp.MediaParsers
             }
         }
 
-        private void ParseSps(ArraySegment<byte> byteSegment, bool hasStartMarker)
+        private void ParseSps(ArraySegment<byte> byteSegment, int startMarkerLength)
         {
             const int spsMinSize = 5;
 
-            if (byteSegment.Count < spsMinSize)
+            if (byteSegment.Count < startMarkerLength + spsMinSize)
                 return;
 
-            ProcessSpsOrPps(byteSegment, hasStartMarker, spsMinSize - 1, _spsMap);
+            ProcessSpsOrPps(byteSegment, startMarkerLength, spsMinSize - 1, _spsMap);
         }
 
-        private void ParsePps(ArraySegment<byte> byteSegment, bool hasStartMarker)
+        private void ParsePps(ArraySegment<byte> byteSegment, int startMarkerLength)
         {
             const int ppsMinSize = 2;
 
-            if (byteSegment.Count < ppsMinSize)
+            if (byteSegment.Count < startMarkerLength + ppsMinSize)
                 return;
 
-            ProcessSpsOrPps(byteSegment, hasStartMarker, ppsMinSize - 1, _ppsMap);
+            ProcessSpsOrPps(byteSegment, startMarkerLength, ppsMinSize - 1, _ppsMap);
         }
 
-        private void ProcessSpsOrPps(ArraySegment<byte> byteSegment, bool hasStartMarker, int offset,
+        private void ProcessSpsOrPps(ArraySegment<byte> byteSegment, int startMarkerLength, int offset,
             Dictionary<int, byte[]> idToBytesMap)
         {
-            _bitStreamReader.ReInitialize(hasStartMarker
-                ? byteSegment.SubSegment(RawH264Frame.StartMarker.Length + offset)
-                : byteSegment.SubSegment(offset));
+            _bitStreamReader.ReInitialize(byteSegment.SubSegment(startMarkerLength + offset));
 
             int id = _bitStreamReader.ReadUe();
 
             if (id == -1)
                 return;
 
-            if (hasStartMarker)
-                byteSegment = byteSegment.SubSegment(RawH264Frame.StartMarker.Length);
+            if (startMarkerLength != 0)
+                byteSegment = byteSegment.SubSegment(startMarkerLength);
 
             if (TryUpdateSpsOrPps(byteSegment, id, idToBytesMap))
                 _updateSpsPpsBytes = true;
@@ -258,12 +265,9 @@ namespace RtspClientSharp.MediaParsers
             }
         }
 
-        private int GetSliceType(ArraySegment<byte> byteSegment, bool hasStartMarker)
+        private int GetSliceType(ArraySegment<byte> byteSegment, int startMarkerLength)
         {
-            int offset = 1;
-
-            if (hasStartMarker)
-                offset += RawH264Frame.StartMarker.Length;
+            int offset = startMarkerLength + 1;
 
             _bitStreamReader.ReInitialize(byteSegment.SubSegment(offset));
 
@@ -276,9 +280,32 @@ namespace RtspClientSharp.MediaParsers
             return nalSliceType;
         }
 
+        private static int GetStartMarkerLength(ArraySegment<byte> byteSegment)
+        {
+            if (byteSegment.Array == null || byteSegment.Count < 3)
+                return 0;
+
+            if (byteSegment.Count >= 4 && byteSegment.Array[byteSegment.Offset] == 0 &&
+                byteSegment.Array[byteSegment.Offset + 1] == 0 &&
+                byteSegment.Array[byteSegment.Offset + 2] == 0 &&
+                byteSegment.Array[byteSegment.Offset + 3] == 1)
+                return RawH264Frame.StartMarker.Length;
+
+            if (byteSegment.Array[byteSegment.Offset] == 0 &&
+                byteSegment.Array[byteSegment.Offset + 1] == 0 &&
+                byteSegment.Array[byteSegment.Offset + 2] == 1)
+                return 3;
+
+            return 0;
+        }
+
         private static FrameType GetFrameType(int sliceType)
         {
-            if (sliceType == 0 || sliceType == 5)
+            // slice_type is specified modulo 5; values 0/5 are P, 1/6 are B,
+            // 3/8 are SP and 4/9 are SI. All of those are dependent frames
+            // and must remain in the stream when the decoder is live.
+            if (sliceType == 0 || sliceType == 1 || sliceType == 3 || sliceType == 4 ||
+                sliceType == 5 || sliceType == 6 || sliceType == 8 || sliceType == 9)
                 return FrameType.PredictionFrame;
             if (sliceType == 2 || sliceType == 7)
                 return FrameType.IntraFrame;

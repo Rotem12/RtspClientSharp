@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include <limits>
 
 struct VideoDecoderContext
 {
@@ -9,6 +10,8 @@ struct VideoDecoderContext
 	AVFrame *active_frame;
 	AVBufferRef *hw_device_ctx;
 	AVPixelFormat hw_pixel_format;
+	uint8_t *input_buffer;
+	unsigned int input_buffer_size;
 	bool hardware_enabled;
 	bool prefer_hardware;
 	HWND render_hwnd;
@@ -48,6 +51,29 @@ struct ScalerContext
 	int scaled_height;
 	AVPixelFormat scaled_pixel_format;
 };
+
+static int prepare_padded_decoder_packet(VideoDecoderContext *context, void *rawBuffer,
+	int rawBufferLength, AVPacket *packet)
+{
+	if (!context || !rawBuffer || rawBufferLength <= 0 || !packet)
+		return -1;
+
+	const size_t paddedLength = static_cast<size_t>(rawBufferLength) + AV_INPUT_BUFFER_PADDING_SIZE;
+	if (paddedLength > (std::numeric_limits<unsigned int>::max)())
+		return -2;
+
+	av_fast_malloc(&context->input_buffer, &context->input_buffer_size, paddedLength);
+	if (!context->input_buffer)
+		return -3;
+
+	memcpy(context->input_buffer, rawBuffer, static_cast<size_t>(rawBufferLength));
+	memset(context->input_buffer + rawBufferLength, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+	av_init_packet(packet);
+	packet->data = context->input_buffer;
+	packet->size = rawBufferLength;
+	return 0;
+}
 
 static void release_render_resources(VideoDecoderContext *context)
 {
@@ -759,9 +785,8 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 	context->active_frame = nullptr;
 
 	AVPacket packet;
-	av_init_packet(&packet);
-	packet.data = static_cast<uint8_t *>(rawBuffer);
-	packet.size = rawBufferLength;
+	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet) < 0)
+		return -6;
 
 	int len = avcodec_send_packet(context->av_codec_context, &packet);
 
@@ -826,9 +851,8 @@ int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength
 	context->active_frame = nullptr;
 
 	AVPacket packet;
-	av_init_packet(&packet);
-	packet.data = static_cast<uint8_t *>(rawBuffer);
-	packet.size = rawBufferLength;
+	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet) < 0)
+		return -6;
 
 	int len = avcodec_send_packet(context->av_codec_context, &packet);
 
@@ -1011,6 +1035,7 @@ void remove_video_decoder(void *handle)
 		avcodec_free_context(&context->av_codec_context);
 	}
 
+	av_free(context->input_buffer);
 	av_buffer_unref(&context->hw_device_ctx);
 	av_frame_free(&context->software_frame);
 	av_frame_free(&context->frame);

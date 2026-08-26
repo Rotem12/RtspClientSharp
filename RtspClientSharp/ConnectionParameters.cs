@@ -33,7 +33,21 @@ namespace RtspClientSharp
         /// Local network interface address used to join multicast groups. Leave null to auto-select.
         /// </summary>
         public IPAddress MulticastInterfaceAddress { get; set; }
-        public bool UseTS { get; set; } = false;
+        /// <summary>
+        /// Selects the media packet format for the direct RtpClient. Auto detects raw MPEG-TS
+        /// versus RTP from the first received datagram.
+        /// </summary>
+        public MediaTransportMode TransportMode { get; set; } = MediaTransportMode.Auto;
+
+        /// <summary>
+        /// Backward-compatible alias for selecting raw MPEG-TS. Reading this property returns
+        /// true only when <see cref="TransportMode"/> is explicitly set to <see cref="MediaTransportMode.MpegTs"/>.
+        /// </summary>
+        public bool UseTS
+        {
+            get => TransportMode == MediaTransportMode.MpegTs;
+            set => TransportMode = value ? MediaTransportMode.MpegTs : MediaTransportMode.Rtp;
+        }
    //     public Codecs.Video.CodecInfoType Parser { get; set; } = Codecs.Video.CodecInfoType.H264;
 
         public ConnectionParameters(Uri connectionUri, Uri streamUri = null)

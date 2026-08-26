@@ -42,12 +42,11 @@ namespace RtspClientSharp.Rtp
         {
             rtpPacket = new RtpPacket();
 
-            Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
-
-            if (byteSegment.Count < RtpHeaderSize)
+            if (byteSegment.Array == null || byteSegment.Count < RtpHeaderSize)
                 return false;
 
             int offset = byteSegment.Offset;
+            int endOffset = byteSegment.Offset + byteSegment.Count;
             rtpPacket.ProtocolVersion = byteSegment.Array[offset] >> 6;
 
             if (rtpPacket.ProtocolVersion != RtpProtocolVersion)
@@ -69,20 +68,36 @@ namespace RtspClientSharp.Rtp
             rtpPacket.SyncSourceId = BigEndianConverter.ReadUInt32(byteSegment.Array, offset);
             offset += 4 + 4 * rtpPacket.CsrcCount;
 
+            if (offset > endOffset)
+                return false;
+
             if (rtpPacket.ExtensionFlag)
             {
+                if (endOffset - offset < 4)
+                    return false;
+
                 rtpPacket.ExtensionHeaderId = BigEndianConverter.ReadUInt16(byteSegment.Array, offset);
                 offset += 2;
 
                 int extensionHeaderLength = BigEndianConverter.ReadUInt16(byteSegment.Array, offset) * 4;
                 offset += 2 + extensionHeaderLength;
+
+                if (offset > endOffset)
+                    return false;
             }
 
-            int payloadSize = byteSegment.Offset + byteSegment.Count - offset;
+            int payloadSize = endOffset - offset;
 
             if (rtpPacket.PaddingFlag)
             {
-                int paddingBytes = byteSegment.Array[byteSegment.Offset + byteSegment.Count - 1];
+                if (payloadSize == 0)
+                    return false;
+
+                int paddingBytes = byteSegment.Array[endOffset - 1];
+
+                if (paddingBytes == 0 || paddingBytes > payloadSize)
+                    return false;
+
                 payloadSize -= paddingBytes;
             }
 
