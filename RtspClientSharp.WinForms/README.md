@@ -18,6 +18,7 @@ var video = new RtspVideoControl
     Dock = DockStyle.Fill,
     SourceType = VideoSourceType.Auto,
     TransportMode = MediaTransportMode.Auto,
+    NoVideoImage = Properties.Resources.novideo,
     PipelineMode = VideoPipelineMode.HardwareDecodeWithCpuReadback,
     ConnectionParameters = new ConnectionParameters(
         new Uri("udp://239.1.1.10:24000"))
@@ -26,6 +27,11 @@ var video = new RtspVideoControl
 Controls.Add(video);
 video.Start();
 ```
+
+`NoVideoImage` is drawn on the empty/stopped surface and before the first
+frame is available. The control does not dispose the assigned image, so a
+resource image can be shared safely and the caller remains responsible for
+disposing images it creates.
 
 `PipelineMode.GpuD3D11EndToEnd` uses the native helper's D3D11 path and falls
 back to a clean software decoder if the adapter/codec cannot use the complete

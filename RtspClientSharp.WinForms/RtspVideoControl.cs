@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -43,10 +44,12 @@ namespace RtspClientSharp.WinForms
         private int _generation;
         private int _playing;
         private int _gpuDecodeFailureCount;
+        private int _gpuSurfaceReady;
         private int _endToEndGpuActive;
         private VideoPipelineMode _pipelineMode = VideoPipelineMode.Software;
         private VideoPipelineMode _effectivePipelineMode = VideoPipelineMode.Software;
         private bool _drawImage = true;
+        private Image _noVideoImage;
         private int _renderIntervalMs = DefaultRenderIntervalMs;
         private VideoRecordingMode _recordingMode = VideoRecordingMode.Auto;
         private int _recordingFrameRate = 30;
@@ -210,6 +213,27 @@ namespace RtspClientSharp.WinForms
             }
         }
 
+        /// <summary>
+        /// Image displayed when the control has no decoded video frame to paint.
+        /// The control keeps the reference but does not dispose the image; the
+        /// caller owns its lifetime.
+        /// </summary>
+        [Category("Appearance")]
+        [Description("Image displayed when no decoded video frame is available.")]
+        [DefaultValue(null)]
+        public Image NoVideoImage
+        {
+            get => _noVideoImage;
+            set
+            {
+                if (ReferenceEquals(_noVideoImage, value))
+                    return;
+
+                _noVideoImage = value;
+                Invalidate(false);
+            }
+        }
+
         public bool ShowFPS { get; set; }
 
         public double DrawLeft { get; set; }
@@ -354,6 +378,7 @@ namespace RtspClientSharp.WinForms
             Volatile.Write(ref _playing, 1);
             _renderTimer.Interval = _renderIntervalMs;
             _renderTimer.Start();
+            Invalidate(false);
             SetStatus("Starting stream...");
 
             try
@@ -410,6 +435,7 @@ namespace RtspClientSharp.WinForms
         public void SetSize()
         {
             UpdateRenderSize(ClientSize);
+            Volatile.Write(ref _endToEndGpuActive, 0);
             DropVideoDecoders();
             ClearPresentedFrame();
             Invalidate(false);
@@ -638,6 +664,7 @@ namespace RtspClientSharp.WinForms
             UpdateRenderSize(ClientSize);
             if (IsPlaying)
             {
+                Volatile.Write(ref _endToEndGpuActive, 0);
                 DropVideoDecoders();
                 ClearPresentedFrame();
             }
@@ -655,14 +682,14 @@ namespace RtspClientSharp.WinForms
             // races the swap chain and produces intermittent black frames.
             bool gpuSurfaceOwnsClientArea = IsPlaying &&
                 DrawImage &&
-                _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd;
+                _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd &&
+                Volatile.Read(ref _gpuSurfaceReady) != 0;
 
             if (!gpuSurfaceOwnsClientArea)
                 e.Graphics.Clear(BackColor);
 
-            if (!gpuSurfaceOwnsClientArea &&
-                _effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd &&
-                DrawImage)
+            bool videoFramePainted = false;
+            if (!gpuSurfaceOwnsClientArea && DrawImage)
             {
                 lock (_frameSyncRoot)
                 {
@@ -675,6 +702,7 @@ namespace RtspClientSharp.WinForms
                         int left = (ClientSize.Width - _frontBitmap.Width) / 2;
                         int top = (ClientSize.Height - _frontBitmap.Height) / 2;
                         e.Graphics.DrawImageUnscaled(_frontBitmap, left, top);
+                        videoFramePainted = true;
                         if (_presentedFrameSequence != _frontFrameSequence)
                         {
                             _presentedFrameSequence = _frontFrameSequence;
@@ -685,12 +713,47 @@ namespace RtspClientSharp.WinForms
                 }
             }
 
+            if (!gpuSurfaceOwnsClientArea && DrawImage && !videoFramePainted)
+                DrawNoVideoImage(e.Graphics);
+
             if (ShowFPS)
             {
                 e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.SingleBitPerPixelGridFit;
                 using (var brush = new SolidBrush(Color.LimeGreen))
                     e.Graphics.DrawString(_displayFps.ToString(), Font, brush, 8, 8);
             }
+        }
+
+        private void DrawNoVideoImage(Graphics graphics)
+        {
+            Image image = _noVideoImage;
+            if (image == null || image.Width <= 0 || image.Height <= 0 ||
+                ClientSize.Width <= 0 || ClientSize.Height <= 0)
+                return;
+
+            Rectangle destination;
+            if (ScaleMode == VideoScaleMode.Stretch)
+            {
+                destination = ClientRectangle;
+            }
+            else
+            {
+                double scale = Math.Min((double)ClientSize.Width / image.Width,
+                    (double)ClientSize.Height / image.Height);
+                int width = Math.Max(1, (int)Math.Round(image.Width * scale));
+                int height = Math.Max(1, (int)Math.Round(image.Height * scale));
+                destination = new Rectangle(
+                    (ClientSize.Width - width) / 2,
+                    (ClientSize.Height - height) / 2,
+                    width,
+                    height);
+            }
+
+            graphics.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            graphics.PixelOffsetMode = PixelOffsetMode.Half;
+            graphics.CompositingQuality = CompositingQuality.HighSpeed;
+            graphics.SmoothingMode = SmoothingMode.HighSpeed;
+            graphics.DrawImage(image, destination);
         }
 
         protected override void Dispose(bool disposing)
@@ -819,6 +882,9 @@ namespace RtspClientSharp.WinForms
                     {
                         decoder = FfmpegVideoDecoder.Create(codecId, true);
                         decoder.SetRenderTarget(Handle);
+                        // From this point onward the native swap chain owns the
+                        // client pixels, even before the first decoded frame.
+                        Volatile.Write(ref _gpuSurfaceReady, 1);
                         _videoDecoders.Add(codecId, decoder);
                     }
 
@@ -1180,6 +1246,8 @@ namespace RtspClientSharp.WinForms
                 _recordingScaledBuffer = Array.Empty<byte>();
             }
 
+            Volatile.Write(ref _gpuSurfaceReady, 0);
+            Volatile.Write(ref _endToEndGpuActive, 0);
             Interlocked.Exchange(ref _waitForH264KeyFrame, 1);
         }
 
@@ -1211,7 +1279,9 @@ namespace RtspClientSharp.WinForms
             // competing WinForms paint for every frame; only the optional FPS
             // overlay needs periodic invalidation in this mode.
             if (ShowFPS ||
-                (DrawImage && _effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd))
+                (DrawImage && _effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd) ||
+                (DrawImage && NoVideoImage != null &&
+                 Volatile.Read(ref _gpuSurfaceReady) == 0))
                 Invalidate(false);
         }
 
