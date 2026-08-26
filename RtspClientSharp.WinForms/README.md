@@ -29,9 +29,11 @@ video.Start();
 ```
 
 `NoVideoImage` is drawn on the empty/stopped surface and before the first
-frame is available. The control does not dispose the assigned image, so a
-resource image can be shared safely and the caller remains responsible for
-disposing images it creates.
+frame is available. After a successfully decoded frame, `NoVideoTimeout` defaults
+to three seconds; a stalled stream then clears the stale surface, resets the
+decoder, and waits for the next keyframe. The control does not dispose the assigned
+image, so a resource image can be shared safely and the caller remains responsible
+for disposing images it creates. `IsNoVideoActive` exposes the timeout state.
 
 `PipelineMode.GpuD3D11EndToEnd` uses the native helper's D3D11 path and falls
 back to a clean software decoder if the adapter/codec cannot use the complete
@@ -52,15 +54,23 @@ without decoding, bitmap allocation, or AForge/FFmpeg re-encoding. Use
 `RecordingMode=VideoRecordingMode.CompressedRemux` to make that choice explicit.
 Use an explicit `.h264` or `.h265` path, or set
 `RecordingFormat=CompressedVideoRecordingFormat.AnnexB`, when a raw Annex-B file
-is preferred. The optional `PreRecordSeconds` buffer stores compressed frames
-and starts at a decodable keyframe.
+is preferred. Set `PreRecordSeconds` before `Start()` to keep a rolling history
+while the control is playing. `StartRecording` prepends that history:
+compressed remux uses copied encoded access units and starts at the nearest
+decodable keyframe; `BitmapFallback` uses decoded bitmap frames. Setting it to
+zero disables the rolling buffer, and changing it while playing takes effect
+on the next start.
 
 For compatibility with bitmap encoders such as AForge, set
 `RecordingMode=VideoRecordingMode.BitmapFallback` and provide
 `BitmapRecorderFactory`. The factory receives the decoded frame size, frame rate,
-and bit rate, and its recorder receives each bitmap synchronously. This mode is
-intentionally more expensive and is not used by default; the control itself has
-no AForge dependency.
+and bit rate, and its recorder receives each bitmap synchronously. Set
+`RecordNoVideoImage=true` to insert the configured `NoVideoImage` at a timeout
+gap and when recording stops during that gap. This mode is intentionally more
+expensive and is not used by default; the control itself has no AForge dependency.
+For legacy applications that generated a frame programmatically, assign
+`NoVideoFrameFactory`; returned bitmaps are disposed after the recorder consumes
+them.
 
 The native `libffmpeghelper.dll` must be deployed beside the application and
 must match the process architecture (`x86` or `x64`). The WinForms project

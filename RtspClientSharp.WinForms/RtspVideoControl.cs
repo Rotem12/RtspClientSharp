@@ -26,6 +26,7 @@ namespace RtspClientSharp.WinForms
 
         private readonly object _decoderSyncRoot = new object();
         private readonly object _frameSyncRoot = new object();
+        private readonly object _fpsSyncRoot = new object();
         private readonly object _recordingSyncRoot = new object();
         private readonly Dictionary<FfmpegVideoCodecId, FfmpegVideoDecoder> _videoDecoders =
             new Dictionary<FfmpegVideoCodecId, FfmpegVideoDecoder>();
@@ -43,6 +44,8 @@ namespace RtspClientSharp.WinForms
         private string _reportedDecoderStatus;
         private int _generation;
         private int _playing;
+        private long _lastVideoActivityTimestamp;
+        private int _noVideoActive;
         private int _gpuDecodeFailureCount;
         private int _gpuSurfaceReady;
         private int _endToEndGpuActive;
@@ -84,7 +87,11 @@ namespace RtspClientSharp.WinForms
         private bool _bitmapRecordingRequested;
         private string _bitmapRecordingPath;
         private DateTime? _bitmapRecordingFirstTimestamp;
+        private int _bitmapRecordingWidth;
+        private int _bitmapRecordingHeight;
         private byte[] _recordingScaledBuffer = Array.Empty<byte>();
+        private TimeSpan _noVideoTimeout = TimeSpan.FromSeconds(3);
+        private int _preRecordSeconds;
 
         public RtspVideoControl()
         {
@@ -201,6 +208,44 @@ namespace RtspClientSharp.WinForms
             }
         }
 
+        /// <summary>
+        /// Amount of time without a successfully decoded frame before the current
+        /// surface is cleared and the decoder is restarted at the next keyframe.
+        /// The default matches AvivVideo's former player behavior.
+        /// </summary>
+        [Category("Behavior")]
+        [Description("Time without a decoded frame before the control displays no-video state.")]
+        public TimeSpan NoVideoTimeout
+        {
+            get => _noVideoTimeout;
+            set
+            {
+                if (value < TimeSpan.Zero)
+                    throw new ArgumentOutOfRangeException(nameof(value));
+
+                _noVideoTimeout = value;
+            }
+        }
+
+        /// <summary>Indicates that the control has entered its no-video timeout state.</summary>
+        public bool IsNoVideoActive => Volatile.Read(ref _noVideoActive) != 0;
+
+        /// <summary>
+        /// When enabled, BitmapFallback recording writes the configured no-video
+        /// image once when a stream gap begins and once when recording stops during
+        /// that gap. Compressed remux recording never synthesizes frames.
+        /// </summary>
+        [Category("Behavior")]
+        [DefaultValue(false)]
+        public bool RecordNoVideoImage { get; set; }
+
+        /// <summary>
+        /// Optional compatibility factory for the bitmap recorder. When it returns
+        /// a bitmap, the control disposes that bitmap after the recorder consumes it.
+        /// The factory is not used by compressed remux recording.
+        /// </summary>
+        public Func<int, int, Bitmap> NoVideoFrameFactory { get; set; }
+
         public bool DrawImage
         {
             get => _drawImage;
@@ -209,6 +254,8 @@ namespace RtspClientSharp.WinForms
                 _drawImage = value;
                 if (!value)
                     ClearPresentedFrame();
+                else if (!IsNoVideoActive)
+                    Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
                 Invalidate(false);
             }
         }
@@ -241,7 +288,19 @@ namespace RtspClientSharp.WinForms
         public double DrawRight { get; set; }
         public double DrawDown { get; set; }
 
-        public int PreRecordSeconds { get; set; }
+        /// <summary>
+        /// Keeps this many seconds of compressed or decoded frames while the
+        /// control is playing. StartRecording includes the retained history.
+        /// Set before <see cref="Start"/>; changing it while playing takes
+        /// effect on the next start.
+        /// </summary>
+        [Category("Recording")]
+        [DefaultValue(0)]
+        public int PreRecordSeconds
+        {
+            get => _preRecordSeconds;
+            set => _preRecordSeconds = Math.Max(0, value);
+        }
 
         public bool IsPlaying => Volatile.Read(ref _playing) != 0;
 
@@ -349,6 +408,9 @@ namespace RtspClientSharp.WinForms
             Volatile.Write(ref _endToEndGpuActive, 0);
             _lastVideoWidth = 0;
             _lastVideoHeight = 0;
+            Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
+            Interlocked.Exchange(ref _noVideoActive, 0);
+            ResetFps();
             LastDecoderStatus = null;
             _reportedDecoderStatus = null;
             DetectedTransportMode = MediaTransportMode.Auto;
@@ -367,6 +429,8 @@ namespace RtspClientSharp.WinForms
                     ? new BitmapVideoRollingBuffer(TimeSpan.FromSeconds(PreRecordSeconds))
                     : null;
                 Volatile.Write(ref _compressedRecordingNeeded, _compressedPreRecord != null ? 1 : 0);
+                _bitmapRecordingWidth = 0;
+                _bitmapRecordingHeight = 0;
             }
 
             IRawFrameSource source = CreateRawFrameSource(connectionParameters);
@@ -424,6 +488,9 @@ namespace RtspClientSharp.WinForms
                 _bitmapPreRecord?.Clear();
                 _bitmapPreRecord = null;
             }
+            Interlocked.Exchange(ref _lastVideoActivityTimestamp, 0);
+            Interlocked.Exchange(ref _noVideoActive, 0);
+            ResetFps();
             DropVideoDecoders();
             Volatile.Write(ref _endToEndGpuActive, 0);
             ClearPresentedFrame();
@@ -435,8 +502,11 @@ namespace RtspClientSharp.WinForms
         public void SetSize()
         {
             UpdateRenderSize(ClientSize);
-            Volatile.Write(ref _endToEndGpuActive, 0);
-            DropVideoDecoders();
+            if (_effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd)
+            {
+                Volatile.Write(ref _endToEndGpuActive, 0);
+                DropVideoDecoders();
+            }
             ClearPresentedFrame();
             Invalidate(false);
         }
@@ -521,9 +591,24 @@ namespace RtspClientSharp.WinForms
                 IBitmapVideoRecorder bitmapRecorder = _bitmapRecorder;
                 _bitmapRecorder = null;
                 bool bitmapRequested = _bitmapRecordingRequested;
+                if (bitmapRecorder != null && bitmapRequested &&
+                    RecordNoVideoImage && IsNoVideoActive)
+                {
+                    try
+                    {
+                        WriteBitmapNoVideoFrame(bitmapRecorder, DateTime.UtcNow);
+                    }
+                    catch (Exception exception)
+                    {
+                        LastRecordingStatus = $"No-video recording frame failed: {exception.Message}";
+                    }
+                }
+
                 _bitmapRecordingRequested = false;
                 _bitmapRecordingPath = null;
                 _bitmapRecordingFirstTimestamp = null;
+                _bitmapRecordingWidth = 0;
+                _bitmapRecordingHeight = 0;
                 if (!bitmapRequested)
                     return;
 
@@ -551,6 +636,8 @@ namespace RtspClientSharp.WinForms
 
                 _bitmapRecordingPath = outputFilePath;
                 _bitmapRecordingFirstTimestamp = null;
+                _bitmapRecordingWidth = 0;
+                _bitmapRecordingHeight = 0;
                 _bitmapRecordingRequested = true;
                 LastRecordingStatus = "Bitmap recording waiting for first decoded frame";
             }
@@ -613,6 +700,8 @@ namespace RtspClientSharp.WinForms
                     BitmapVideoRecorderOptions options = new BitmapVideoRecorderOptions(
                         _bitmapRecordingPath, bitmap.Width, bitmap.Height,
                         RecordingFrameRate, RecordingBitRate);
+                    _bitmapRecordingWidth = bitmap.Width;
+                    _bitmapRecordingHeight = bitmap.Height;
                     IBitmapVideoRecorder recorder = BitmapRecorderFactory(options);
                     if (recorder == null)
                         throw new InvalidOperationException(
@@ -658,14 +747,53 @@ namespace RtspClientSharp.WinForms
             return timestamp - _bitmapRecordingFirstTimestamp.Value;
         }
 
+        private void WriteBitmapNoVideoFrame(IBitmapVideoRecorder recorder, DateTime timestamp)
+        {
+            if (recorder == null || _bitmapRecordingWidth <= 0 || _bitmapRecordingHeight <= 0)
+                return;
+
+            using (Bitmap bitmap = CreateNoVideoBitmap(_bitmapRecordingWidth, _bitmapRecordingHeight))
+            {
+                if (bitmap == null)
+                    return;
+
+                recorder.Write(bitmap, GetRecordingTimestamp(timestamp));
+            }
+        }
+
+        private Bitmap CreateNoVideoBitmap(int width, int height)
+        {
+            if (width <= 0 || height <= 0)
+                return null;
+
+            Bitmap customBitmap = NoVideoFrameFactory?.Invoke(width, height);
+            if (customBitmap != null)
+                return customBitmap;
+
+            if (_noVideoImage == null)
+                return null;
+
+            var bitmap = new Bitmap(width, height, PixelFormat.Format24bppRgb);
+            using (Graphics graphics = Graphics.FromImage(bitmap))
+            {
+                graphics.Clear(BackColor);
+                DrawNoVideoImage(graphics, new Rectangle(0, 0, width, height));
+            }
+
+            return bitmap;
+        }
+
         protected override void OnResize(EventArgs e)
         {
             base.OnResize(e);
             UpdateRenderSize(ClientSize);
             if (IsPlaying)
             {
-                Volatile.Write(ref _endToEndGpuActive, 0);
-                DropVideoDecoders();
+                if (_effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd)
+                {
+                    Volatile.Write(ref _endToEndGpuActive, 0);
+                    DropVideoDecoders();
+                }
                 ClearPresentedFrame();
             }
         }
@@ -707,6 +835,7 @@ namespace RtspClientSharp.WinForms
                         {
                             _presentedFrameSequence = _frontFrameSequence;
                             Interlocked.Increment(ref _presentedFrameCount);
+                            UpdateFps();
                         }
                         Interlocked.Exchange(ref _pendingFrame, 0);
                     }
@@ -714,7 +843,7 @@ namespace RtspClientSharp.WinForms
             }
 
             if (!gpuSurfaceOwnsClientArea && DrawImage && !videoFramePainted)
-                DrawNoVideoImage(e.Graphics);
+                DrawNoVideoImage(e.Graphics, ClientRectangle);
 
             if (ShowFPS)
             {
@@ -724,27 +853,27 @@ namespace RtspClientSharp.WinForms
             }
         }
 
-        private void DrawNoVideoImage(Graphics graphics)
+        private void DrawNoVideoImage(Graphics graphics, Rectangle bounds)
         {
             Image image = _noVideoImage;
             if (image == null || image.Width <= 0 || image.Height <= 0 ||
-                ClientSize.Width <= 0 || ClientSize.Height <= 0)
+                bounds.Width <= 0 || bounds.Height <= 0)
                 return;
 
             Rectangle destination;
             if (ScaleMode == VideoScaleMode.Stretch)
             {
-                destination = ClientRectangle;
+                destination = bounds;
             }
             else
             {
-                double scale = Math.Min((double)ClientSize.Width / image.Width,
-                    (double)ClientSize.Height / image.Height);
+                double scale = Math.Min((double)bounds.Width / image.Width,
+                    (double)bounds.Height / image.Height);
                 int width = Math.Max(1, (int)Math.Round(image.Width * scale));
                 int height = Math.Max(1, (int)Math.Round(image.Height * scale));
                 destination = new Rectangle(
-                    (ClientSize.Width - width) / 2,
-                    (ClientSize.Height - height) / 2,
+                    bounds.Left + (bounds.Width - width) / 2,
+                    bounds.Top + (bounds.Height - height) / 2,
                     width,
                     height);
             }
@@ -906,6 +1035,7 @@ namespace RtspClientSharp.WinForms
                         Interlocked.Exchange(ref _gpuDecodeFailureCount, 0);
                         Volatile.Write(ref _lastVideoWidth, parameters.Width);
                         Volatile.Write(ref _lastVideoHeight, parameters.Height);
+                        MarkVideoFrameActivity();
                         if (rawVideoFrame is RawH264IFrame)
                             Interlocked.Exchange(ref _waitForH264KeyFrame, 0);
                         Interlocked.Increment(ref _nativeDecodedFrameCount);
@@ -916,6 +1046,7 @@ namespace RtspClientSharp.WinForms
                             decoder.RenderGpuFrame(ClampCrop(DrawLeft), ClampCrop(DrawUp),
                                 ClampCrop(DrawRight), ClampCrop(DrawDown));
                             Interlocked.Increment(ref _gpuRenderedFrameCount);
+                            UpdateFps();
                         }
                         else
                         {
@@ -1003,6 +1134,7 @@ namespace RtspClientSharp.WinForms
                 if (rawVideoFrame is RawH264IFrame)
                     Interlocked.Exchange(ref _waitForH264KeyFrame, 0);
                 Interlocked.Increment(ref _nativeDecodedFrameCount);
+                MarkVideoFrameActivity();
 
                 // The decoder must consume every frame to keep its reference chain valid,
                 // but the UI only needs the newest frame. Do not spend another scaler copy
@@ -1068,7 +1200,6 @@ namespace RtspClientSharp.WinForms
                 Volatile.Write(ref _lastVideoWidth, parameters.Width);
                 Volatile.Write(ref _lastVideoHeight, parameters.Height);
                 Interlocked.Increment(ref _decodedFrameCount);
-                UpdateFps();
                 ReportDecoderStatus(codecId, decoder);
             }
 
@@ -1248,6 +1379,7 @@ namespace RtspClientSharp.WinForms
 
             Volatile.Write(ref _gpuSurfaceReady, 0);
             Volatile.Write(ref _endToEndGpuActive, 0);
+            Interlocked.Exchange(ref _lastGpuRenderTimestamp, 0);
             Interlocked.Exchange(ref _waitForH264KeyFrame, 1);
         }
 
@@ -1275,26 +1407,98 @@ namespace RtspClientSharp.WinForms
             if (!IsPlaying)
                 return;
 
+            CheckForVideoTimeout();
+
             // Present() refreshes the GPU-owned surface. Avoid scheduling a
             // competing WinForms paint for every frame; only the optional FPS
             // overlay needs periodic invalidation in this mode.
             if (ShowFPS ||
-                (DrawImage && _effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd) ||
-                (DrawImage && NoVideoImage != null &&
-                 Volatile.Read(ref _gpuSurfaceReady) == 0))
+                (DrawImage && _effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd))
                 Invalidate(false);
+        }
+
+        private void CheckForVideoTimeout()
+        {
+            if (!IsPlaying || (!DrawImage && !ShouldProcessBitmapRecordingFrames))
+                return;
+
+            long lastActivity = Interlocked.Read(ref _lastVideoActivityTimestamp);
+            if (lastActivity == 0)
+                return;
+
+            if ((Stopwatch.GetTimestamp() - lastActivity) / (double)Stopwatch.Frequency <
+                NoVideoTimeout.TotalSeconds)
+                return;
+
+            if (Interlocked.Exchange(ref _noVideoActive, 1) != 0)
+                return;
+
+            DropVideoDecoders();
+            if (DrawImage)
+                ClearPresentedFrame();
+
+            ResetFps();
+            TryRecordNoVideoFrame();
+            SetStatus("No video frames");
+            if (DrawImage)
+                Invalidate(false);
+        }
+
+        private void MarkVideoFrameActivity()
+        {
+            Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
+            if (Interlocked.Exchange(ref _noVideoActive, 0) != 0)
+                SetStatus("Video frames resumed");
+        }
+
+        private void TryRecordNoVideoFrame()
+        {
+            if (!RecordNoVideoImage)
+                return;
+
+            try
+            {
+                lock (_recordingSyncRoot)
+                {
+                    if (!_bitmapRecordingRequested || _bitmapRecorder == null)
+                        return;
+
+                    WriteBitmapNoVideoFrame(_bitmapRecorder, DateTime.UtcNow);
+                    if (_bitmapRecorder.OutputFilePath != null)
+                        LastRecordingStatus = $"Bitmap recording: {_bitmapRecorder.OutputFilePath}";
+                }
+            }
+            catch (Exception exception)
+            {
+                StopRecording();
+                LastRecordingStatus = $"Bitmap recording failed: {exception.Message}";
+                SetDecoderStatus($"Bitmap recording failed: {exception.Message}");
+            }
         }
 
         private void UpdateFps()
         {
-            _fpsWindowFrames++;
-            DateTime now = DateTime.UtcNow;
-            if ((now - _fpsWindowStart).TotalSeconds < 1)
-                return;
+            lock (_fpsSyncRoot)
+            {
+                _fpsWindowFrames++;
+                DateTime now = DateTime.UtcNow;
+                if ((now - _fpsWindowStart).TotalSeconds < 1)
+                    return;
 
-            _displayFps = _fpsWindowFrames;
-            _fpsWindowFrames = 0;
-            _fpsWindowStart = now;
+                _displayFps = _fpsWindowFrames;
+                _fpsWindowFrames = 0;
+                _fpsWindowStart = now;
+            }
+        }
+
+        private void ResetFps()
+        {
+            lock (_fpsSyncRoot)
+            {
+                _fpsWindowStart = DateTime.UtcNow;
+                _fpsWindowFrames = 0;
+                _displayFps = 0;
+            }
         }
 
         private void SetStatus(string status)
