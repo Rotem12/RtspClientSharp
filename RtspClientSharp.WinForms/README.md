@@ -33,14 +33,28 @@ D3D11 path. Select `HardwareDecodeWithCpuReadback` explicitly when that
 trade-off is preferred. The control keeps
 the native decoder consuming every H.264 frame while limiting expensive
 managed scaling and bitmap copies to the newest frame available for painting.
+For cameras that signal constrained-baseline H.264 as ordinary Baseline, the
+hardware path applies FFmpeg's constrained-baseline compatibility fallback
+automatically. `IsHardwareDecodeActive`, `IsEndToEndGpuActive`, and
+`GpuRenderedFrameCount` expose whether decoding and actual native GPU
+presentation succeeded; `PresentedFrameCount` counts only WinForms/GDI paints.
 
-Recording is independent of rendering. `StartRecording("capture.wma")` selects
-the low-copy video-only MPEG-TS recorder and creates `capture.ts`; it writes the
-compressed H.264/H.265 access units directly, without decoding, bitmap
-allocation, or AForge/FFmpeg re-encoding. Use an explicit `.h264` or `.h265`
-path, or set `RecordingFormat=CompressedVideoRecordingFormat.AnnexB`, when a
-raw Annex-B file is preferred. The optional `PreRecordSeconds` buffer stores
-compressed frames and starts at a decodable keyframe.
+Recording is independent of rendering. `StartRecording("capture.wma")` uses
+`RecordingMode=Auto`, which selects the low-copy video-only MPEG-TS recorder and
+creates `capture.ts`; it writes the compressed H.264/H.265 access units directly,
+without decoding, bitmap allocation, or AForge/FFmpeg re-encoding. Use
+`RecordingMode=VideoRecordingMode.CompressedRemux` to make that choice explicit.
+Use an explicit `.h264` or `.h265` path, or set
+`RecordingFormat=CompressedVideoRecordingFormat.AnnexB`, when a raw Annex-B file
+is preferred. The optional `PreRecordSeconds` buffer stores compressed frames
+and starts at a decodable keyframe.
+
+For compatibility with bitmap encoders such as AForge, set
+`RecordingMode=VideoRecordingMode.BitmapFallback` and provide
+`BitmapRecorderFactory`. The factory receives the decoded frame size, frame rate,
+and bit rate, and its recorder receives each bitmap synchronously. This mode is
+intentionally more expensive and is not used by default; the control itself has
+no AForge dependency.
 
 The native `libffmpeghelper.dll` must be deployed beside the application and
 must match the process architecture (`x86` or `x64`). The WinForms project
@@ -57,5 +71,7 @@ thread. Marshal to the UI thread when updating controls. The diagnostic
 counters (`TransportDatagramCount`, `TransportFrameCount`,
 `TransportDroppedFrameCount`, `ReceivedVideoFrameCount`,
 `NativeDecodedFrameCount`, `DecodedFrameCount`, `DroppedFrameCount`, and
-`PresentedFrameCount`) can be used to separate socket/parser delivery,
-dispatcher loss, decoder failure, and intentional display throttling.
+`PresentedFrameCount`, plus `IsHardwareDecodeActive`, `IsEndToEndGpuActive`,
+and `GpuRenderedFrameCount`) can be used to separate socket/parser delivery,
+dispatcher loss, decoder failure, GPU presentation, and intentional display
+throttling.

@@ -76,7 +76,9 @@ input and sniff RTP versus MPEG-TS automatically. The control uses a bounded
 latest-frame display buffer, supports software/D3D11 pipelines, and records
 H.264/H.265 directly into video-only MPEG-TS without decoding or AForge. Use an
 explicit `.h264` or `.h265` output path when a raw Annex-B elementary stream is
-required.
+required. Set `VideoRecordingMode.BitmapFallback` with a
+`BitmapRecorderFactory` only when compatibility with a bitmap encoder such as
+AForge is required.
 
 See [the WinForms control README](RtspClientSharp.WinForms/README.md) for
 deployment and direct-RTP SPS/PPS details. The native

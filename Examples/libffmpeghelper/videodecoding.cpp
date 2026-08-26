@@ -10,6 +10,7 @@ struct VideoDecoderContext
 	AVFrame *active_frame;
 	AVBufferRef *hw_device_ctx;
 	AVPixelFormat hw_pixel_format;
+	int hardware_format_attempts;
 	uint8_t *input_buffer;
 	unsigned int input_buffer_size;
 	bool hardware_enabled;
@@ -594,11 +595,37 @@ static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *p
 
 	if (context && context->hardware_enabled)
 	{
+		if (context->hardware_format_attempts++ == 0)
+		{
+			av_log(avctx, AV_LOG_INFO,
+				"RtspClientSharp D3D11VA negotiation: profile=%d coded=%dx%d sw_pix_fmt=%s requested_hw_fmt=%s candidates=",
+				avctx->profile, avctx->coded_width, avctx->coded_height,
+				av_get_pix_fmt_name(avctx->sw_pix_fmt) ? av_get_pix_fmt_name(avctx->sw_pix_fmt) : "unknown",
+				av_get_pix_fmt_name(context->hw_pixel_format) ? av_get_pix_fmt_name(context->hw_pixel_format) : "unknown");
+
+			for (const AVPixelFormat *candidate = pixel_formats;
+				candidate && *candidate != AV_PIX_FMT_NONE; candidate++)
+			{
+				const char *name = av_get_pix_fmt_name(*candidate);
+				av_log(avctx, AV_LOG_INFO, " %s(%d)", name ? name : "unknown", *candidate);
+			}
+
+			av_log(avctx, AV_LOG_INFO, "\n");
+		}
+
 		for (const AVPixelFormat *format = pixel_formats; *format != AV_PIX_FMT_NONE; format++)
 		{
 			if (*format == context->hw_pixel_format)
 				return *format;
 		}
+
+		// FFmpeg may accept the decoder while selecting a software format after
+		// D3D11VA negotiation fails. Do not keep reporting hardware as active in
+		// that case; callers need to be able to choose a clean software fallback.
+		context->hardware_enabled = false;
+		av_log(avctx, AV_LOG_WARNING,
+			"RtspClientSharp D3D11VA hardware format %s was not offered; using software decode\n",
+			av_get_pix_fmt_name(context->hw_pixel_format) ? av_get_pix_fmt_name(context->hw_pixel_format) : "unknown");
 	}
 
 	return avcodec_default_get_format(avctx, pixel_formats);
@@ -608,6 +635,7 @@ static bool try_enable_d3d11va(VideoDecoderContext *context)
 {
 	context->hardware_enabled = false;
 	context->hw_pixel_format = AV_PIX_FMT_NONE;
+	context->hardware_format_attempts = 0;
 	av_buffer_unref(&context->hw_device_ctx);
 
 	for (int i = 0;; i++)
@@ -621,6 +649,10 @@ static bool try_enable_d3d11va(VideoDecoderContext *context)
 			config->device_type == AV_HWDEVICE_TYPE_D3D11VA)
 		{
 			context->hw_pixel_format = config->pix_fmt;
+			av_log(context->av_codec_context, AV_LOG_INFO,
+				"RtspClientSharp D3D11VA config: pix_fmt=%s(%d) methods=0x%x\n",
+				av_get_pix_fmt_name(config->pix_fmt) ? av_get_pix_fmt_name(config->pix_fmt) : "unknown",
+				config->pix_fmt, config->methods);
 			break;
 		}
 	}
@@ -648,6 +680,16 @@ static int open_decoder(VideoDecoderContext *context, bool preferHardware)
 {
 	context->av_codec_context->opaque = context;
 	context->av_codec_context->get_format = get_hw_format;
+
+	// Some cameras signal constrained-baseline H.264 as profile 66 (Baseline)
+	// while setting constraint_set1_flag in the SPS. FFmpeg's DXVA/D3D11
+	// compatibility table uses the distinct constrained-baseline profile value,
+	// so without this flag it rejects every otherwise valid hardware decoder
+	// before asking the driver to create it.
+	if (preferHardware && context->codec->id == AV_CODEC_ID_H264)
+		context->av_codec_context->hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
+	else
+		context->av_codec_context->hwaccel_flags &= ~AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
 
 	if (preferHardware && try_enable_d3d11va(context))
 	{
@@ -995,9 +1037,8 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 	ID3D11ShaderResourceView *nullViews[2] = {};
 	immediateContext->PSSetShaderResources(0, 2, nullViews);
 
-	context->swap_chain->Present(0, 0);
-
-	return 0;
+	const HRESULT presentResult = context->swap_chain->Present(0, 0);
+	return SUCCEEDED(presentResult) ? 0 : -40;
 }
 
 int create_video_decoder(int codec_id, void **handle)

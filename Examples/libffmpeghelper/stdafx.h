@@ -20,6 +20,8 @@ extern "C"
 	#include <libavutil/imgutils.h>
 	#include <libavutil/hwcontext.h>
 	#include <libavutil/mathematics.h>
+	#include <libavutil/log.h>
+	#include <libavutil/pixdesc.h>
 	#include <libavutil/samplefmt.h>
 	#include <libswscale/swscale.h>
     #include <libavutil/samplefmt.h>
