@@ -81,6 +81,31 @@ namespace RtspClientSharp.UnitTests.MediaParsers
         }
 
         [TestMethod]
+        public void Parse_PFrameBeforeSpsPpsThenIFrame_GeneratesFirstIFrame()
+        {
+            var spsBytes = Convert.FromBase64String("AAAAAWdNQCmaZgUB7YC1AQEBBenA");
+            var ppsBytes = Convert.FromBase64String("AAAAAWjuPIA=");
+            var iFrameBytes = new byte[] {0x0, 0x0, 0x0, 0x1, 0x65, 0x88, 0x80, 0x10, 0x00};
+            var pFrameBytes = new byte[] {0x0, 0x0, 0x0, 0x1, 0x61, 0x9a, 0x01, 0x01, 0x64};
+
+            RawH264Frame frame = null;
+            var parser = new H264Parser(() => DateTime.UtcNow)
+            {
+                FrameGenerated = rawFrame => frame = (RawH264Frame)rawFrame
+            };
+
+            parser.Parse(new ArraySegment<byte>(pFrameBytes), true);
+            Assert.IsNull(frame);
+
+            parser.Parse(new ArraySegment<byte>(spsBytes), false);
+            parser.Parse(new ArraySegment<byte>(ppsBytes), false);
+            parser.Parse(new ArraySegment<byte>(iFrameBytes), true);
+
+            Assert.IsInstanceOfType(frame, typeof(RawH264IFrame));
+            Assert.IsTrue(frame.FrameSegment.SequenceEqual(iFrameBytes));
+        }
+
+        [TestMethod]
         public void Parse_ThreeByteAnnexBMarkers_GeneratesIFrame()
         {
             var spsBytes = ToThreeByteStartMarker(Convert.FromBase64String("AAAAAWdNQCmaZgUB7YC1AQEBBenA"));

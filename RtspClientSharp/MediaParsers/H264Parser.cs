@@ -70,11 +70,16 @@ namespace RtspClientSharp.MediaParsers
                 _updateSpsPpsBytes = false;
             }
 
-            if (_sliceType == -1 || _spsPpsBytes.Length == 0)
+            if (_sliceType == -1)
                 return;
 
-            FrameType frameType = GetFrameType(_sliceType);
+            int sliceType = _sliceType;
             _sliceType = -1;
+
+            if (_spsPpsBytes.Length == 0)
+                return;
+
+            FrameType frameType = GetFrameType(sliceType);
             DateTime frameTimestamp;
 
             if (frameType == FrameType.PredictionFrame && !_waitForIFrame)
