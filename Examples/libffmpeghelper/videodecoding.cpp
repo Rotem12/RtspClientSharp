@@ -25,8 +25,6 @@ struct VideoDecoderContext
 	ID3D11Texture2D *shader_texture;
 	ID3D11ShaderResourceView *shader_resource_view_y;
 	ID3D11ShaderResourceView *shader_resource_view_uv;
-	ID3D11ShaderResourceView *source_shader_resource_view_y;
-	ID3D11ShaderResourceView *source_shader_resource_view_uv;
 	DXGI_FORMAT shader_texture_format;
 	int shader_texture_width;
 	int shader_texture_height;
@@ -40,8 +38,6 @@ struct VideoDecoderContext
 	float crop_top;
 	float crop_right;
 	float crop_bottom;
-	UINT crop_array_slice;
-	bool source_shader_resource_views_valid;
 };
 
 struct RenderCropConstants
@@ -50,8 +46,6 @@ struct RenderCropConstants
 	float crop_top;
 	float crop_right;
 	float crop_bottom;
-	UINT array_slice;
-	UINT padding[3];
 };
 
 struct ScalerContext
@@ -167,18 +161,6 @@ static void release_render_resources(VideoDecoderContext *context)
 		context->shader_resource_view_uv = nullptr;
 	}
 
-	if (context->source_shader_resource_view_y)
-	{
-		context->source_shader_resource_view_y->Release();
-		context->source_shader_resource_view_y = nullptr;
-	}
-
-	if (context->source_shader_resource_view_uv)
-	{
-		context->source_shader_resource_view_uv->Release();
-		context->source_shader_resource_view_uv = nullptr;
-	}
-
 	context->shader_texture_format = DXGI_FORMAT_UNKNOWN;
 	context->shader_texture_width = 0;
 	context->shader_texture_height = 0;
@@ -188,8 +170,6 @@ static void release_render_resources(VideoDecoderContext *context)
 	context->source_texture_desc = {};
 	context->source_texture_desc_valid = false;
 	context->crop_constants_valid = false;
-	context->crop_array_slice = 0;
-	context->source_shader_resource_views_valid = false;
 }
 
 static int compile_shader(const char *source, const char *entryPoint, const char *target, ID3DBlob **blob)
@@ -210,27 +190,25 @@ static int ensure_render_shaders(VideoDecoderContext *context, ID3D11Device *dev
 		return 0;
 
 	const char *vertexShaderSource =
-		"cbuffer CropBuffer : register(b0) { float4 crop; uint arraySlice; uint3 padding; };"
-		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; nointerpolation uint arraySlice : TEXCOORD1; };"
+		"cbuffer CropBuffer : register(b0) { float4 crop; };"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
 		"VSOut main(uint id : SV_VertexID) {"
 		"  float2 pos[3] = { float2(-1.0,-1.0), float2(-1.0,3.0), float2(3.0,-1.0) };"
 		"  float2 uv[3] = { float2(0.0,1.0), float2(0.0,-1.0), float2(2.0,1.0) };"
 		"  VSOut output;"
 		"  output.pos = float4(pos[id], 0.0, 1.0);"
 		"  output.uv = float2(lerp(crop.x, 1.0 - crop.z, uv[id].x), lerp(crop.y, 1.0 - crop.w, uv[id].y));"
-		"  output.arraySlice = arraySlice;"
 		"  return output;"
 		"}";
 
 	const char *pixelShaderSource =
-		"Texture2DArray texY : register(t0);"
-		"Texture2DArray texUV : register(t1);"
+		"Texture2D texY : register(t0);"
+		"Texture2D texUV : register(t1);"
 		"SamplerState samp : register(s0);"
-		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; nointerpolation uint arraySlice : TEXCOORD1; };"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
 		"float4 main(VSOut input) : SV_TARGET {"
-		"  float3 sampleLocation = float3(input.uv, input.arraySlice);"
-		"  float y = texY.Sample(samp, sampleLocation).r;"
-		"  float2 uv = texUV.Sample(samp, sampleLocation).rg - float2(0.5, 0.5);"
+		"  float y = texY.Sample(samp, input.uv).r;"
+		"  float2 uv = texUV.Sample(samp, input.uv).rg - float2(0.5, 0.5);"
 		"  float r = y + 1.5748 * uv.y;"
 		"  float g = y - 0.1873 * uv.x - 0.4681 * uv.y;"
 		"  float b = y + 1.8556 * uv.x;"
@@ -335,18 +313,57 @@ static int ensure_swap_chain(VideoDecoderContext *context, ID3D11Device *device,
 			return -4;
 		}
 
-		DXGI_SWAP_CHAIN_DESC desc = {};
-		desc.BufferCount = 2;
-		desc.BufferDesc.Width = width;
-		desc.BufferDesc.Height = height;
-		desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-		desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-		desc.OutputWindow = context->render_hwnd;
-		desc.SampleDesc.Count = 1;
-		desc.Windowed = TRUE;
-		desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+		HRESULT hr = E_FAIL;
+		IDXGIFactory2 *factory2 = nullptr;
+		if (SUCCEEDED(factory->QueryInterface(__uuidof(IDXGIFactory2),
+			reinterpret_cast<void **>(&factory2))))
+		{
+			// The flip model lets DWM retain the presented surface across expose
+			// and resize paints. The older blt/discard model can briefly reveal a
+			// WinForms background on child HWNDs even when Present succeeds.
+			DXGI_SWAP_CHAIN_DESC1 desc = {};
+			desc.Width = static_cast<UINT>(width);
+			desc.Height = static_cast<UINT>(height);
+			desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			desc.BufferCount = 2;
+			desc.SampleDesc.Count = 1;
+			desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+			desc.Scaling = DXGI_SCALING_STRETCH;
+			desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
-		const HRESULT hr = factory->CreateSwapChain(device, &desc, &context->swap_chain);
+			IDXGISwapChain1 *swapChain1 = nullptr;
+			hr = factory2->CreateSwapChainForHwnd(device, context->render_hwnd,
+				&desc, nullptr, nullptr, &swapChain1);
+			if (SUCCEEDED(hr) && swapChain1)
+			{
+				hr = swapChain1->QueryInterface(__uuidof(IDXGISwapChain),
+					reinterpret_cast<void **>(&context->swap_chain));
+			}
+			else if (SUCCEEDED(hr))
+				hr = E_NOINTERFACE;
+
+			if (swapChain1)
+				swapChain1->Release();
+
+			factory2->Release();
+		}
+
+		if (FAILED(hr))
+		{
+			// Keep a blt-model fallback for older WDDM/DXGI implementations.
+			DXGI_SWAP_CHAIN_DESC desc = {};
+			desc.BufferCount = 2;
+			desc.BufferDesc.Width = width;
+			desc.BufferDesc.Height = height;
+			desc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+			desc.OutputWindow = context->render_hwnd;
+			desc.SampleDesc.Count = 1;
+			desc.Windowed = TRUE;
+			desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+			hr = factory->CreateSwapChain(device, &desc, &context->swap_chain);
+		}
 
 		factory->Release();
 		adapter->Release();
@@ -441,11 +458,9 @@ static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *dev
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC yDesc = {};
 	yDesc.Format = yFormat;
-	yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-	yDesc.Texture2DArray.MostDetailedMip = 0;
-	yDesc.Texture2DArray.MipLevels = 1;
-	yDesc.Texture2DArray.FirstArraySlice = 0;
-	yDesc.Texture2DArray.ArraySize = 1;
+	yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	yDesc.Texture2D.MostDetailedMip = 0;
+	yDesc.Texture2D.MipLevels = 1;
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc = yDesc;
 	uvDesc.Format = uvFormat;
@@ -459,84 +474,6 @@ static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *dev
 	context->shader_texture_width = static_cast<int>(sourceDesc.Width);
 	context->shader_texture_height = static_cast<int>(sourceDesc.Height);
 	context->shader_texture_format = sourceDesc.Format;
-	return 0;
-}
-
-static int ensure_source_shader_views(VideoDecoderContext *context, ID3D11Device *device,
-	ID3D11Texture2D *sourceTexture, const D3D11_TEXTURE2D_DESC &sourceDesc)
-{
-	if (!context || !device || !sourceTexture ||
-		(sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
-		(sourceDesc.Format != DXGI_FORMAT_NV12 && sourceDesc.Format != DXGI_FORMAT_P010 &&
-		 sourceDesc.Format != DXGI_FORMAT_P016))
-		return -1;
-
-	if (context->source_shader_resource_views_valid &&
-		context->source_texture == sourceTexture &&
-		context->source_texture_desc.Width == sourceDesc.Width &&
-		context->source_texture_desc.Height == sourceDesc.Height &&
-		context->source_texture_desc.ArraySize == sourceDesc.ArraySize &&
-		context->source_texture_desc.Format == sourceDesc.Format)
-		return 0;
-
-	if (context->source_shader_resource_view_y)
-	{
-		context->source_shader_resource_view_y->Release();
-		context->source_shader_resource_view_y = nullptr;
-	}
-
-	if (context->source_shader_resource_view_uv)
-	{
-		context->source_shader_resource_view_uv->Release();
-		context->source_shader_resource_view_uv = nullptr;
-	}
-
-	DXGI_FORMAT yFormat = DXGI_FORMAT_UNKNOWN;
-	DXGI_FORMAT uvFormat = DXGI_FORMAT_UNKNOWN;
-	if (sourceDesc.Format == DXGI_FORMAT_NV12)
-	{
-		yFormat = DXGI_FORMAT_R8_UNORM;
-		uvFormat = DXGI_FORMAT_R8G8_UNORM;
-	}
-	else
-	{
-		yFormat = DXGI_FORMAT_R16_UNORM;
-		uvFormat = DXGI_FORMAT_R16G16_UNORM;
-	}
-
-	D3D11_SHADER_RESOURCE_VIEW_DESC yDesc = {};
-	yDesc.Format = yFormat;
-	if (sourceDesc.ArraySize > 1)
-	{
-		yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-		yDesc.Texture2DArray.MostDetailedMip = 0;
-		yDesc.Texture2DArray.MipLevels = 1;
-		yDesc.Texture2DArray.FirstArraySlice = 0;
-		yDesc.Texture2DArray.ArraySize = sourceDesc.ArraySize;
-	}
-	else
-	{
-		yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-		yDesc.Texture2D.MostDetailedMip = 0;
-		yDesc.Texture2D.MipLevels = 1;
-	}
-
-	D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc = yDesc;
-	uvDesc.Format = uvFormat;
-
-	if (FAILED(device->CreateShaderResourceView(sourceTexture, &yDesc,
-		&context->source_shader_resource_view_y)))
-		return -2;
-
-	if (FAILED(device->CreateShaderResourceView(sourceTexture, &uvDesc,
-		&context->source_shader_resource_view_uv)))
-	{
-		context->source_shader_resource_view_y->Release();
-		context->source_shader_resource_view_y = nullptr;
-		return -3;
-	}
-
-	context->source_shader_resource_views_valid = true;
 	return 0;
 }
 
@@ -716,45 +653,6 @@ static int ensure_source_shader_views(VideoDecoderContext *context, ID3D11Device
 //	texture->Release();
 //}
 
-static int configure_d3d11va_shader_frames(AVCodecContext *avctx, VideoDecoderContext *context)
-{
-	if (!avctx || !context || !context->hw_device_ctx || context->hw_pixel_format == AV_PIX_FMT_NONE)
-		return -1;
-
-	AVBufferRef *framesReference = nullptr;
-	int result = avcodec_get_hw_frames_parameters(avctx, context->hw_device_ctx,
-		context->hw_pixel_format, &framesReference);
-	if (result < 0 || !framesReference)
-		return result < 0 ? result : -2;
-
-	AVHWFramesContext *framesContext = reinterpret_cast<AVHWFramesContext *>(framesReference->data);
-	AVD3D11VAFramesContext *d3d11FramesContext = framesContext
-		? static_cast<AVD3D11VAFramesContext *>(framesContext->hwctx)
-		: nullptr;
-	if (!d3d11FramesContext)
-	{
-		av_buffer_unref(&framesReference);
-		return -3;
-	}
-
-	// FFmpeg's default D3D11VA pool is decoder-only. Adding the shader binding
-	// allows the renderer to sample the decoder surface directly and avoids a
-	// full-frame CopySubresourceRegion on every presented frame.
-	d3d11FramesContext->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
-	result = av_hwframe_ctx_init(framesReference);
-	if (result < 0)
-	{
-		av_buffer_unref(&framesReference);
-		return result;
-	}
-
-	avctx->hw_frames_ctx = framesReference;
-	av_log(avctx, AV_LOG_INFO,
-		"RtspClientSharp D3D11VA shader-readable frame pool active: bind_flags=0x%x array_pool=%d\n",
-		d3d11FramesContext->BindFlags, framesContext->initial_pool_size);
-	return 0;
-}
-
 static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *pixel_formats)
 {
 	const auto context = static_cast<VideoDecoderContext *>(avctx->opaque);
@@ -782,13 +680,7 @@ static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *p
 		for (const AVPixelFormat *format = pixel_formats; *format != AV_PIX_FMT_NONE; format++)
 		{
 			if (*format == context->hw_pixel_format)
-			{
-				if (configure_d3d11va_shader_frames(avctx, context) < 0)
-					av_log(avctx, AV_LOG_INFO,
-						"RtspClientSharp D3D11VA shader-readable frame pool unavailable; using copy renderer\n");
-
 				return *format;
-			}
 		}
 
 		// FFmpeg may accept the decoder while selecting a software format after
@@ -1188,34 +1080,29 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 	if (arraySlice >= textureDesc.ArraySize)
 		return -9;
 
-	ID3D11ShaderResourceView *views[2] = {};
-	if (textureDesc.ArraySize > 1 &&
-		(textureDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 &&
-		ensure_source_shader_views(context, device, texture, textureDesc) == 0)
-	{
-		views[0] = context->source_shader_resource_view_y;
-		views[1] = context->source_shader_resource_view_uv;
-	}
-	else
-	{
-		result = ensure_shader_texture(context, device, textureDesc);
-		if (result != 0)
-			return -30 + result;
+	// Do not sample the decoder's surface array directly. D3D11VA is allowed
+	// to recycle a decode surface as soon as FFmpeg advances the frame, while
+	// the compositor may still be scanning out the previous Present(). Copying
+	// into an owned single-surface texture keeps the GPU path zero-CPU-copy and
+	// makes the decoder/render hand-off ordered on this immediate context.
+	result = ensure_shader_texture(context, device, textureDesc);
+	if (result != 0)
+		return -30 + result;
 
-		immediateContext->CopySubresourceRegion(context->shader_texture, 0, 0, 0, 0,
-			texture, D3D11CalcSubresource(0, arraySlice, 1), nullptr);
-		views[0] = context->shader_resource_view_y;
-		views[1] = context->shader_resource_view_uv;
-	}
+	immediateContext->CopySubresourceRegion(context->shader_texture, 0, 0, 0, 0,
+		texture, D3D11CalcSubresource(0, arraySlice, 1), nullptr);
+	ID3D11ShaderResourceView *views[2] = {
+		context->shader_resource_view_y,
+		context->shader_resource_view_uv
+	};
 
 	const float nextCropLeft = static_cast<float>(cropLeft);
 	const float nextCropTop = static_cast<float>(cropTop);
 	const float nextCropRight = static_cast<float>(cropRight);
 	const float nextCropBottom = static_cast<float>(cropBottom);
-	const UINT nextArraySlice = arraySlice;
 	if (!context->crop_constants_valid || context->crop_left != nextCropLeft ||
 		context->crop_top != nextCropTop || context->crop_right != nextCropRight ||
-		context->crop_bottom != nextCropBottom || context->crop_array_slice != nextArraySlice)
+		context->crop_bottom != nextCropBottom)
 	{
 		D3D11_MAPPED_SUBRESOURCE mapped = {};
 		if (SUCCEEDED(immediateContext->Map(context->crop_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -1225,14 +1112,12 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 			constants->crop_top = nextCropTop;
 			constants->crop_right = nextCropRight;
 			constants->crop_bottom = nextCropBottom;
-			constants->array_slice = nextArraySlice;
 			immediateContext->Unmap(context->crop_buffer, 0);
 
 			context->crop_left = nextCropLeft;
 			context->crop_top = nextCropTop;
 			context->crop_right = nextCropRight;
 			context->crop_bottom = nextCropBottom;
-			context->crop_array_slice = nextArraySlice;
 			context->crop_constants_valid = true;
 		}
 	}

@@ -33,6 +33,7 @@ namespace RtspClientSharp.WinForms
         private readonly Dictionary<FfmpegVideoCodecId, int> _decoderStatusStates =
             new Dictionary<FfmpegVideoCodecId, int>();
         private readonly System.Windows.Forms.Timer _renderTimer;
+        private readonly GpuVideoSurfaceControl _gpuSurface;
 
         private ConnectionParameters _connectionParameters;
         private IRawFrameSource _rawFrameSource;
@@ -113,6 +114,14 @@ namespace RtspClientSharp.WinForms
                      ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
                      ControlStyles.Opaque, true);
             BackColor = Color.Black;
+            _gpuSurface = new GpuVideoSurfaceControl
+            {
+                Dock = DockStyle.Fill,
+                Visible = false,
+                BackColor = BackColor,
+                TabStop = false,
+            };
+            Controls.Add(_gpuSurface);
             _renderTimer = new System.Windows.Forms.Timer { Interval = DefaultRenderIntervalMs };
             _renderTimer.Tick += RenderTimerOnTick;
             UpdateRenderSize(ClientSize);
@@ -156,6 +165,7 @@ namespace RtspClientSharp.WinForms
                 _pipelineMode = value;
                 _effectivePipelineMode = value;
                 UpdateWinFormsPaintMode(value);
+                RequestGpuSurfaceVisibilityUpdate();
                 DropVideoDecoders();
             }
         }
@@ -273,6 +283,7 @@ namespace RtspClientSharp.WinForms
                     ClearPresentedFrame();
                 else if (!IsNoVideoActive)
                     Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
+                RequestGpuSurfaceVisibilityUpdate();
                 Invalidate(false);
             }
         }
@@ -470,6 +481,7 @@ namespace RtspClientSharp.WinForms
 
             _rawFrameSource = source;
             Volatile.Write(ref _playing, 1);
+            RequestGpuSurfaceVisibilityUpdate();
             _renderTimer.Interval = _renderIntervalMs;
             _renderTimer.Start();
             Invalidate(false);
@@ -497,6 +509,7 @@ namespace RtspClientSharp.WinForms
             Interlocked.Increment(ref _generation);
             bool wasPlaying = Interlocked.Exchange(ref _playing, 0) != 0;
             _renderTimer.Stop();
+            RequestGpuSurfaceVisibilityUpdate();
 
             IRawFrameSource source = _rawFrameSource;
             _rawFrameSource = null;
@@ -854,6 +867,13 @@ namespace RtspClientSharp.WinForms
             }
         }
 
+        protected override void OnBackColorChanged(EventArgs e)
+        {
+            base.OnBackColorChanged(e);
+            if (_gpuSurface != null)
+                _gpuSurface.BackColor = BackColor;
+        }
+
         protected override void OnPaintBackground(PaintEventArgs e)
         {
             // OnPaint clears the exact client area. Avoid a second erase pass.
@@ -861,9 +881,9 @@ namespace RtspClientSharp.WinForms
 
         protected override void OnPaint(PaintEventArgs e)
         {
-            // The end-to-end GPU path owns the client pixels through its DXGI
-            // swap chain. Clearing the control from WinForms after Present()
-            // races the swap chain and produces intermittent black frames.
+            // The end-to-end GPU path uses a child HWND for its DXGI swap chain.
+            // Keep the parent WinForms paint out of the active video surface;
+            // the parent is responsible for its delayed no-video state.
             bool gpuPipelineActive = IsPlaying &&
                 DrawImage &&
                 _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd;
@@ -1125,7 +1145,7 @@ namespace RtspClientSharp.WinForms
                     if (!_videoDecoders.TryGetValue(codecId, out FfmpegVideoDecoder decoder))
                     {
                         decoder = FfmpegVideoDecoder.Create(codecId, true);
-                        decoder.SetRenderTarget(Handle);
+                        decoder.SetRenderTarget(_gpuSurface.Handle);
                         _videoDecoders.Add(codecId, decoder);
                         reportDecoderStatus = true;
                     }
@@ -1556,9 +1576,9 @@ namespace RtspClientSharp.WinForms
             if (GetStyle(ControlStyles.OptimizedDoubleBuffer) == useWinFormsDoubleBuffer)
                 return;
 
-            // A native DXGI swap chain and a WinForms back-buffer must not both
-            // own the same HWND. The managed back-buffer is still useful for
-            // software/readback modes, where OnPaint draws the front bitmap.
+            // The managed back-buffer is useful for software/readback modes,
+            // where OnPaint draws the front bitmap. The native GPU surface is a
+            // separate child HWND and therefore does not need this back-buffer.
             SetStyle(ControlStyles.OptimizedDoubleBuffer, useWinFormsDoubleBuffer);
             UpdateStyles();
         }
@@ -1569,6 +1589,7 @@ namespace RtspClientSharp.WinForms
                 return;
 
             CheckForVideoTimeout();
+            RequestGpuSurfaceVisibilityUpdate();
 
             // Present() refreshes the GPU-owned surface. Avoid scheduling a
             // competing WinForms paint for every frame; only the optional FPS
@@ -1595,6 +1616,7 @@ namespace RtspClientSharp.WinForms
             if (Interlocked.Exchange(ref _noVideoActive, 1) != 0)
                 return;
 
+            RequestGpuSurfaceVisibilityUpdate();
             DropVideoDecoders();
             if (DrawImage)
                 ClearPresentedFrame();
@@ -1700,6 +1722,86 @@ namespace RtspClientSharp.WinForms
         private static double ClampCrop(double value)
         {
             return Math.Max(0, Math.Min(0.95, value));
+        }
+
+        private void RequestGpuSurfaceVisibilityUpdate()
+        {
+            if (_gpuSurface == null || _gpuSurface.IsDisposed)
+                return;
+
+            if (IsHandleCreated && InvokeRequired)
+            {
+                try
+                {
+                    BeginInvoke(new Action(UpdateGpuSurfaceVisibility));
+                }
+                catch (InvalidOperationException)
+                {
+                    // The control can be disposed while the receive worker is
+                    // unwinding. The normal Dispose path will release the child.
+                }
+                return;
+            }
+
+            UpdateGpuSurfaceVisibility();
+        }
+
+        private void UpdateGpuSurfaceVisibility()
+        {
+            if (_gpuSurface == null || _gpuSurface.IsDisposed)
+                return;
+
+            bool visible = IsPlaying && DrawImage &&
+                           _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd &&
+                           !IsNoVideoActive;
+            if (_gpuSurface.Visible != visible)
+                _gpuSurface.Visible = visible;
+
+            if (visible)
+                _gpuSurface.BringToFront();
+        }
+
+        private sealed class GpuVideoSurfaceControl : Control
+        {
+            private const int WmEraseBackground = 0x0014;
+            private const int WmNcHitTest = 0x0084;
+            private const int HtTransparent = -1;
+
+            public GpuVideoSurfaceControl()
+            {
+                SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.Opaque, true);
+            }
+
+            protected override void OnPaintBackground(PaintEventArgs e)
+            {
+                // DXGI owns this child HWND while the GPU pipeline is active.
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                // Do not let a WinForms paint erase or redraw the DXGI surface.
+            }
+
+            protected override void WndProc(ref Message m)
+            {
+                if (m.Msg == WmEraseBackground)
+                {
+                    m.Result = (IntPtr)1;
+                    return;
+                }
+
+                if (m.Msg == WmNcHitTest)
+                {
+                    // Keep existing parent/player mouse gestures, such as the
+                    // double-click fullscreen command, working through the GPU
+                    // surface child.
+                    m.Result = (IntPtr)HtTransparent;
+                    return;
+                }
+
+                base.WndProc(ref m);
+            }
         }
 
         private static long MillisecondsToStopwatchTicks(int milliseconds)
