@@ -62,6 +62,10 @@ namespace RtspClientSharp.WinForms
         internal static extern int DecodeFrame(IntPtr handle, IntPtr rawBuffer, int rawBufferLength,
             out int frameWidth, out int frameHeight, out FfmpegPixelFormat framePixelFormat);
 
+        [DllImport(LibraryName, EntryPoint = "decode_video_frame_padded", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int DecodeFramePadded(IntPtr handle, IntPtr rawBuffer, int rawBufferLength,
+            out int frameWidth, out int frameHeight, out FfmpegPixelFormat framePixelFormat);
+
         [DllImport(LibraryName, EntryPoint = "is_video_decoder_hardware_accelerated", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int IsVideoDecoderHardwareAccelerated(IntPtr handle);
 
@@ -70,6 +74,10 @@ namespace RtspClientSharp.WinForms
 
         [DllImport(LibraryName, EntryPoint = "decode_video_frame_to_gpu", CallingConvention = CallingConvention.Cdecl)]
         internal static extern int DecodeFrameToGpu(IntPtr handle, IntPtr rawBuffer, int rawBufferLength,
+            out int frameWidth, out int frameHeight, out FfmpegPixelFormat framePixelFormat);
+
+        [DllImport(LibraryName, EntryPoint = "decode_video_frame_to_gpu_padded", CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int DecodeFrameToGpuPadded(IntPtr handle, IntPtr rawBuffer, int rawBufferLength,
             out int frameWidth, out int frameHeight, out FfmpegPixelFormat framePixelFormat);
 
         [DllImport(LibraryName, EntryPoint = "render_gpu_decoded_video_frame", CallingConvention = CallingConvention.Cdecl)]
@@ -257,16 +265,18 @@ namespace RtspClientSharp.WinForms
             new Dictionary<VideoTransformParameters, FfmpegVideoScaler>();
         private byte[] _extraData = Array.Empty<byte>();
         private DecodedVideoFrameParameters _currentFrameParameters;
+        private bool _isHardwareAccelerated;
         private bool _disposed;
 
         private FfmpegVideoDecoder(FfmpegVideoCodecId codecId, IntPtr decoderHandle)
         {
             _codecId = codecId;
             _decoderHandle = decoderHandle;
+            RefreshHardwareAcceleration();
         }
 
         public int LastGpuDecodeResult { get; private set; }
-        public bool IsHardwareAccelerated => FfmpegVideoPInvoke.IsVideoDecoderHardwareAccelerated(_decoderHandle) != 0;
+        public bool IsHardwareAccelerated => _isHardwareAccelerated;
 
         public static FfmpegVideoDecoder Create(FfmpegVideoCodecId codecId, bool preferHardwareAcceleration)
         {
@@ -300,12 +310,16 @@ namespace RtspClientSharp.WinForms
             FfmpegPixelFormat pixelFormat;
             fixed (byte* rawBufferPointer = &segment.Array[segment.Offset])
             {
-                resultCode = FfmpegVideoPInvoke.DecodeFrame(_decoderHandle, (IntPtr)rawBufferPointer,
-                    segment.Count, out width, out height, out pixelFormat);
+                resultCode = rawVideoFrame.HasDecoderInputPadding
+                    ? FfmpegVideoPInvoke.DecodeFramePadded(_decoderHandle, (IntPtr)rawBufferPointer,
+                        segment.Count, out width, out height, out pixelFormat)
+                    : FfmpegVideoPInvoke.DecodeFrame(_decoderHandle, (IntPtr)rawBufferPointer,
+                        segment.Count, out width, out height, out pixelFormat);
             }
 
             if (resultCode != 0)
             {
+                RefreshHardwareAcceleration();
                 frameParameters = null;
                 return false;
             }
@@ -333,13 +347,17 @@ namespace RtspClientSharp.WinForms
             FfmpegPixelFormat pixelFormat;
             fixed (byte* rawBufferPointer = &segment.Array[segment.Offset])
             {
-                resultCode = FfmpegVideoPInvoke.DecodeFrameToGpu(_decoderHandle, (IntPtr)rawBufferPointer,
-                    segment.Count, out width, out height, out pixelFormat);
+                resultCode = rawVideoFrame.HasDecoderInputPadding
+                    ? FfmpegVideoPInvoke.DecodeFrameToGpuPadded(_decoderHandle, (IntPtr)rawBufferPointer,
+                        segment.Count, out width, out height, out pixelFormat)
+                    : FfmpegVideoPInvoke.DecodeFrameToGpu(_decoderHandle, (IntPtr)rawBufferPointer,
+                        segment.Count, out width, out height, out pixelFormat);
             }
 
             LastGpuDecodeResult = resultCode;
             if (resultCode != 0)
             {
+                RefreshHardwareAcceleration();
                 frameParameters = null;
                 return false;
             }
@@ -386,12 +404,22 @@ namespace RtspClientSharp.WinForms
             {
                 fixed (byte* destinationPointer = destination)
                 {
-                    int resultCode = FfmpegVideoPInvoke.ScaleDecodedVideoFrame(_decoderHandle, scaler.Handle,
-                        (IntPtr)destinationPointer, scaler.ScaledStride);
-                    if (resultCode != 0)
-                        throw new DecoderException($"An error occurred while scaling video frame for {_codecId}, code: {resultCode}");
+                    ScaleTo(scaler, (IntPtr)destinationPointer, scaler.ScaledStride);
                 }
             }
+        }
+
+        public void ScaleTo(FfmpegVideoScaler scaler, IntPtr destination, int destinationStride)
+        {
+            if (scaler == null)
+                throw new ArgumentNullException(nameof(scaler));
+            if (destination == IntPtr.Zero || destinationStride == 0)
+                throw new ArgumentException("A valid destination buffer is required.", nameof(destination));
+
+            int resultCode = FfmpegVideoPInvoke.ScaleDecodedVideoFrame(_decoderHandle, scaler.Handle,
+                destination, destinationStride);
+            if (resultCode != 0)
+                throw new DecoderException($"An error occurred while scaling video frame for {_codecId}, code: {resultCode}");
         }
 
         public void Dispose()
@@ -433,7 +461,14 @@ namespace RtspClientSharp.WinForms
                     (IntPtr)extraDataPointer, _extraData.Length);
                 if (resultCode != 0)
                     throw new DecoderException($"An error occurred while setting video extra data for {_codecId}, code: {resultCode}");
+
+                RefreshHardwareAcceleration();
             }
+        }
+
+        private void RefreshHardwareAcceleration()
+        {
+            _isHardwareAccelerated = FfmpegVideoPInvoke.IsVideoDecoderHardwareAccelerated(_decoderHandle) != 0;
         }
 
         private void UpdateFrameParameters(int width, int height, FfmpegPixelFormat pixelFormat)

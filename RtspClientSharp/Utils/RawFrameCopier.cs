@@ -99,6 +99,9 @@ namespace RtspClientSharp.Utils
                 throw;
             }
 
+            if (copiedFrame is RawVideoFrame copiedVideoFrame)
+                copiedVideoFrame.HasDecoderInputPadding = true;
+
             return new RawFrameCopy(copiedFrame, frameBuffer, parametersBuffer);
         }
 
@@ -120,11 +123,12 @@ namespace RtspClientSharp.Utils
             if (segment.Array == null || segment.Count == 0)
                 return new ArraySegment<byte>(Array.Empty<byte>());
 
-            byte[] bytes = ArrayPool<byte>.Shared.Rent(segment.Count);
+            byte[] bytes = ArrayPool<byte>.Shared.Rent(segment.Count + RawVideoFramePadding.Size);
 
             try
             {
                 Buffer.BlockCopy(segment.Array, segment.Offset, bytes, 0, segment.Count);
+                Array.Clear(bytes, segment.Count, RawVideoFramePadding.Size);
             }
             catch
             {

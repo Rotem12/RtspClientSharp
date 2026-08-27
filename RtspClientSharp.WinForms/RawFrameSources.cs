@@ -19,6 +19,7 @@ namespace RtspClientSharp.WinForms
         long TransportFrameCount { get; }
         long TransportDroppedFrameCount { get; }
 
+        void SetRawFrameForwarding(bool enabled);
         void Start();
         void Stop();
     }
@@ -33,8 +34,10 @@ namespace RtspClientSharp.WinForms
         long TransportFrameCount { get; }
         long TransportDroppedFrameCount { get; }
 
+        void SetRawFrameForwarding(bool enabled);
         Task ConnectAsync(CancellationToken token);
         Task ReceiveAsync(CancellationToken token);
+        Task ReceiveLoopAsync(CancellationToken token);
     }
 
     internal sealed class RawFrameSource : IRawFrameSource
@@ -48,6 +51,8 @@ namespace RtspClientSharp.WinForms
         private long _transportDatagramCount;
         private long _transportFrameCount;
         private long _transportDroppedFrameCount;
+        private IRawFrameClient _currentClient;
+        private int _rawFrameForwarding;
         private bool _disposed;
 
         public RawFrameSource(Func<IRawFrameClient> clientFactory)
@@ -60,9 +65,56 @@ namespace RtspClientSharp.WinForms
         public event EventHandler<string> StatusChanged;
         public MediaTransportMode DetectedTransportMode =>
             (MediaTransportMode)Volatile.Read(ref _detectedTransportMode);
-        public long TransportDatagramCount => Interlocked.Read(ref _transportDatagramCount);
-        public long TransportFrameCount => Interlocked.Read(ref _transportFrameCount);
-        public long TransportDroppedFrameCount => Interlocked.Read(ref _transportDroppedFrameCount);
+        public long TransportDatagramCount
+        {
+            get
+            {
+                CaptureCurrentClientMetrics();
+                return Interlocked.Read(ref _transportDatagramCount);
+            }
+        }
+        public long TransportFrameCount
+        {
+            get
+            {
+                CaptureCurrentClientMetrics();
+                return Interlocked.Read(ref _transportFrameCount);
+            }
+        }
+        public long TransportDroppedFrameCount
+        {
+            get
+            {
+                CaptureCurrentClientMetrics();
+                return Interlocked.Read(ref _transportDroppedFrameCount);
+            }
+        }
+
+        public void SetRawFrameForwarding(bool enabled)
+        {
+            lock (_syncRoot)
+            {
+                int value = enabled ? 1 : 0;
+                if (_rawFrameForwarding == value)
+                    return;
+
+                _rawFrameForwarding = value;
+                IRawFrameClient client = _currentClient;
+                if (client == null)
+                    return;
+
+                if (enabled)
+                {
+                    client.RawFrameGenerated += ClientOnFrameGenerated;
+                    client.SetRawFrameForwarding(true);
+                }
+                else
+                {
+                    client.SetRawFrameForwarding(false);
+                    client.RawFrameGenerated -= ClientOnFrameGenerated;
+                }
+            }
+        }
 
         public void Start()
         {
@@ -126,8 +178,16 @@ namespace RtspClientSharp.WinForms
                 {
                     using (IRawFrameClient client = _clientFactory())
                     {
-                        client.RawFrameGenerated += ClientOnFrameGenerated;
-                        client.FrameReceived += ClientOnFrameReceived;
+                        lock (_syncRoot)
+                        {
+                            _currentClient = client;
+                            if (_rawFrameForwarding != 0)
+                            {
+                                client.RawFrameGenerated += ClientOnFrameGenerated;
+                                client.SetRawFrameForwarding(true);
+                            }
+                            client.FrameReceived += ClientOnFrameReceived;
+                        }
                         try
                         {
                             OnStatusChanged("Connecting...");
@@ -136,24 +196,17 @@ namespace RtspClientSharp.WinForms
                             UpdateTransportMetrics(client);
                             OnStatusChanged("Receiving frames...");
 
-                            while (!token.IsCancellationRequested)
+                            try
                             {
-                                try
-                                {
-                                    await client.ReceiveAsync(token).ConfigureAwait(false);
-                                    Volatile.Write(ref _detectedTransportMode,
-                                        (int)client.DetectedTransportMode);
-                                    UpdateTransportMetrics(client);
-                                }
-                                catch (OperationCanceledException)
-                                {
-                                    throw;
-                                }
-                                catch (RtspClientException exception)
-                                {
-                                    OnStatusChanged(exception.Message);
-                                    break;
-                                }
+                                await client.ReceiveLoopAsync(token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                throw;
+                            }
+                            catch (RtspClientException exception)
+                            {
+                                OnStatusChanged(exception.Message);
                             }
                         }
                         catch (InvalidCredentialException)
@@ -170,8 +223,14 @@ namespace RtspClientSharp.WinForms
                         }
                         finally
                         {
-                            client.RawFrameGenerated -= ClientOnFrameGenerated;
-                            client.FrameReceived -= ClientOnFrameReceived;
+                            lock (_syncRoot)
+                            {
+                                client.SetRawFrameForwarding(false);
+                                client.RawFrameGenerated -= ClientOnFrameGenerated;
+                                client.FrameReceived -= ClientOnFrameReceived;
+                                if (ReferenceEquals(_currentClient, client))
+                                    _currentClient = null;
+                            }
                         }
                     }
 
@@ -190,20 +249,37 @@ namespace RtspClientSharp.WinForms
 
         private void ClientOnFrameReceived(object sender, RawFrame rawFrame)
         {
-            if (sender is IRawFrameClient client)
+            if (Volatile.Read(ref _detectedTransportMode) == (int)MediaTransportMode.Auto &&
+                sender is IRawFrameClient client)
             {
-                Volatile.Write(ref _detectedTransportMode, (int)client.DetectedTransportMode);
-                // RTSP ReceiveAsync owns a long-running read loop, so it may not
-                // return to ReceiveLoopAsync between frames. Keep the source
-                // counters current here for live diagnostics.
-                UpdateTransportMetrics(client);
+                UpdateDetectedTransportMode(client);
             }
             FrameReceived?.Invoke(this, rawFrame);
         }
 
         private void ClientOnFrameGenerated(object sender, RawFrame rawFrame)
         {
+            if (Volatile.Read(ref _detectedTransportMode) == (int)MediaTransportMode.Auto &&
+                sender is IRawFrameClient client)
+                UpdateDetectedTransportMode(client);
+
             RawFrameGenerated?.Invoke(this, rawFrame);
+        }
+
+        private void UpdateDetectedTransportMode(IRawFrameClient client)
+        {
+            int mode = (int)client.DetectedTransportMode;
+            if (Volatile.Read(ref _detectedTransportMode) != mode)
+                Volatile.Write(ref _detectedTransportMode, mode);
+        }
+
+        private void CaptureCurrentClientMetrics()
+        {
+            IRawFrameClient client = Volatile.Read(ref _currentClient);
+            if (client == null)
+                return;
+
+            UpdateTransportMetrics(client);
         }
 
         private void UpdateTransportMetrics(IRawFrameClient client)
@@ -222,11 +298,14 @@ namespace RtspClientSharp.WinForms
     internal sealed class RtspRawFrameClient : IRawFrameClient
     {
         private readonly RtspClient _client;
+        private bool _rawFrameForwarding;
 
         public RtspRawFrameClient(ConnectionParameters connectionParameters)
         {
-            _client = new RtspClient(connectionParameters);
-            _client.RawFrameGenerated += ClientOnRawFrameGenerated;
+            _client = new RtspClient(connectionParameters)
+            {
+                UseInlineFrameDelivery = true
+            };
             _client.FrameReceived += ClientOnFrameReceived;
         }
 
@@ -239,9 +318,23 @@ namespace RtspClientSharp.WinForms
 
         public Task ConnectAsync(CancellationToken token) => _client.ConnectAsync(token);
         public Task ReceiveAsync(CancellationToken token) => _client.ReceiveAsync(token);
+        public Task ReceiveLoopAsync(CancellationToken token) => _client.ReceiveAsync(token);
+
+        public void SetRawFrameForwarding(bool enabled)
+        {
+            if (_rawFrameForwarding == enabled)
+                return;
+
+            _rawFrameForwarding = enabled;
+            if (enabled)
+                _client.RawFrameGenerated += ClientOnRawFrameGenerated;
+            else
+                _client.RawFrameGenerated -= ClientOnRawFrameGenerated;
+        }
 
         public void Dispose()
         {
+            SetRawFrameForwarding(false);
             _client.RawFrameGenerated -= ClientOnRawFrameGenerated;
             _client.FrameReceived -= ClientOnFrameReceived;
             _client.Dispose();
@@ -261,6 +354,7 @@ namespace RtspClientSharp.WinForms
     internal sealed class DirectUdpRawFrameClient : IRawFrameClient
     {
         private readonly DirectRtpClient _client;
+        private bool _rawFrameForwarding;
 
         public DirectUdpRawFrameClient(ConnectionParameters connectionParameters, bool isH264,
             byte[] h264SpsPpsBytes)
@@ -268,9 +362,9 @@ namespace RtspClientSharp.WinForms
             _client = new DirectRtpClient(connectionParameters)
             {
                 IsH264 = isH264,
-                H264SpsPpsBytes = h264SpsPpsBytes ?? Array.Empty<byte>()
+                H264SpsPpsBytes = h264SpsPpsBytes ?? Array.Empty<byte>(),
+                UseInlineFrameDelivery = true
             };
-            _client.RawFrameGenerated += ClientOnRawFrameGenerated;
             _client.FrameReceived += ClientOnFrameReceived;
         }
 
@@ -283,9 +377,23 @@ namespace RtspClientSharp.WinForms
 
         public Task ConnectAsync(CancellationToken token) => _client.ConnectAsync(token);
         public Task ReceiveAsync(CancellationToken token) => _client.ReceiveAsync(token);
+        public Task ReceiveLoopAsync(CancellationToken token) => _client.ReceiveLoopAsync(token);
+
+        public void SetRawFrameForwarding(bool enabled)
+        {
+            if (_rawFrameForwarding == enabled)
+                return;
+
+            _rawFrameForwarding = enabled;
+            if (enabled)
+                _client.RawFrameGenerated += ClientOnRawFrameGenerated;
+            else
+                _client.RawFrameGenerated -= ClientOnRawFrameGenerated;
+        }
 
         public void Dispose()
         {
+            SetRawFrameForwarding(false);
             _client.RawFrameGenerated -= ClientOnRawFrameGenerated;
             _client.FrameReceived -= ClientOnFrameReceived;
             _client.Dispose();

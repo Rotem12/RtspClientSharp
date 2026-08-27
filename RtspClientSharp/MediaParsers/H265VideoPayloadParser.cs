@@ -215,6 +215,7 @@ namespace RtspClientSharp.MediaParsers
             if (endMarker)
             {
                 // End part of Fragment               
+                RawVideoFramePadding.Ensure(_nalStream);
                 var nalUnitSegment = new ArraySegment<byte>(_nalStream.GetBuffer(), 0, (int)_nalStream.Position);
                 _nalStream.Position = 0;
                 _h265Parser.Parse(nalUnitSegment, markerBit);

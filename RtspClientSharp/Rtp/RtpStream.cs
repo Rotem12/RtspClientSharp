@@ -1,6 +1,8 @@
 ﻿using System;
 using RtspClientSharp.MediaParsers;
 
+using RtspClientSharp.RawFrames.Video;
+
 namespace RtspClientSharp.Rtp
 {
     class RtpStream : ITransportStream, IRtpStatisticsProvider
@@ -8,10 +10,12 @@ namespace RtspClientSharp.Rtp
         private readonly IRtpSequenceAssembler _rtpSequenceAssembler;
         private readonly IMediaPayloadParser _mediaPayloadParser;
         private readonly int _samplesFrequency;
+        private readonly bool _ensureVideoInputPadding;
 
         private ulong _samplesSum;
         private ushort _previousSeqNumber;
         private uint _previousTimestamp;
+        private TimeSpan _currentTimeOffset;
         private bool _isFirstPacket = true;
 
         public uint SyncSourceId { get; private set; }
@@ -22,13 +26,14 @@ namespace RtspClientSharp.Rtp
         public ushort SequenceCycles { get; private set; }
 
         public RtpStream(IMediaPayloadParser mediaPayloadParser, int samplesFrequency,
-            IRtpSequenceAssembler rtpSequenceAssembler = null)
+            IRtpSequenceAssembler rtpSequenceAssembler = null, bool ensureVideoInputPadding = false)
         {
             _mediaPayloadParser = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
             if (samplesFrequency < 0)
                 throw new ArgumentOutOfRangeException(nameof(samplesFrequency));
 
             _samplesFrequency = samplesFrequency;
+            _ensureVideoInputPadding = ensureVideoInputPadding;
 
             if (rtpSequenceAssembler != null)
             {
@@ -52,7 +57,13 @@ namespace RtspClientSharp.Rtp
         {
             SyncSourceId = rtpPacket.SyncSourceId;
 
-            if (!_isFirstPacket)
+            if (_isFirstPacket)
+            {
+                _currentTimeOffset = _samplesFrequency != 0
+                    ? TimeSpan.Zero
+                    : TimeSpan.MinValue;
+            }
+            else
             {
                 int delta = (ushort)(rtpPacket.SeqNumber - _previousSeqNumber);
 
@@ -76,7 +87,13 @@ namespace RtspClientSharp.Rtp
                 if (rtpPacket.SeqNumber < HighestSequenceNumberReceived)
                     ++SequenceCycles;
 
-                _samplesSum += unchecked(rtpPacket.Timestamp - _previousTimestamp);
+                if (rtpPacket.Timestamp != _previousTimestamp)
+                {
+                    _samplesSum += unchecked(rtpPacket.Timestamp - _previousTimestamp);
+                    _currentTimeOffset = _samplesFrequency != 0
+                        ? TimeSpan.FromSeconds(_samplesSum / (double)_samplesFrequency)
+                        : TimeSpan.MinValue;
+                }
             }
 
             HighestSequenceNumberReceived = rtpPacket.SeqNumber;
@@ -89,12 +106,15 @@ namespace RtspClientSharp.Rtp
             if (rtpPacket.PayloadSegment.Count == 0)
                 return;
 
-            TimeSpan timeOffset = _samplesFrequency != 0
-                ? TimeSpan.FromSeconds(_samplesSum / (double)_samplesFrequency)
-                : TimeSpan.MinValue;
+            // Direct UDP buffers are owned by the receive loop and are not read
+            // again until this synchronous parser callback returns. Zeroing the
+            // FFmpeg tail here lets the decoder consume the payload directly.
+            // TCP/TPKT callers leave this disabled because bytes after a payload
+            // may already contain the next interleaved packet.
+            if (_ensureVideoInputPadding)
+                RawVideoFramePadding.ClearIfAvailable(rtpPacket.PayloadSegment);
 
-
-            _mediaPayloadParser.Parse(timeOffset, rtpPacket.PayloadSegment, rtpPacket.MarkerBit);
+            _mediaPayloadParser.Parse(_currentTimeOffset, rtpPacket.PayloadSegment, rtpPacket.MarkerBit);
         }
 
         public void ResetState()

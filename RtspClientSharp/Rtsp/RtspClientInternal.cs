@@ -12,6 +12,7 @@ using RtspClientSharp.Codecs.Audio;
 using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.MediaParsers;
 using RtspClientSharp.RawFrames;
+using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Rtcp;
 using RtspClientSharp.Rtp;
 using RtspClientSharp.Sdp;
@@ -39,7 +40,7 @@ namespace RtspClientSharp.Rtsp
 
         private TpktStream _tpktStream;
 
-        private readonly RawFrameDispatcher _frameDispatcher;
+		private RawFrameDispatcher _frameDispatcher;
         private readonly Random _random = RandomGeneratorFactory.CreateGenerator();
         private IRtspTransportClient _rtspTransportClient;
 
@@ -52,6 +53,13 @@ namespace RtspClientSharp.Rtsp
         public Action<RawFrame> FrameReceived;
         public Action<RawFrame> RawFrameGenerated;
 
+        /// <summary>
+        /// When enabled, the frame callback is invoked before the parser returns
+        /// and no owned display copy is created. The caller must consume the
+        /// frame synchronously.
+        /// </summary>
+        public bool UseInlineFrameDelivery { get; set; }
+
         public RtspClientInternal(ConnectionParameters connectionParameters,
             Func<IRtspTransportClient> transportClientProvider = null)
         {
@@ -60,8 +68,7 @@ namespace RtspClientSharp.Rtsp
             _transportClientProvider = transportClientProvider ?? CreateTransportClient;
 
             Uri fixedRtspUri = connectionParameters.GetFixedRtspUri();
-            _requestMessageFactory = new RtspRequestMessageFactory(fixedRtspUri, connectionParameters.UserAgent);
-            _frameDispatcher = new RawFrameDispatcher(frame => FrameReceived?.Invoke(frame));
+			_requestMessageFactory = new RtspRequestMessageFactory(fixedRtspUri, connectionParameters.UserAgent);
         }
 
         public async Task ConnectAsync(CancellationToken token)
@@ -152,7 +159,7 @@ namespace RtspClientSharp.Rtsp
             if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
                 return;
 
-            _frameDispatcher.Dispose();
+			Interlocked.Exchange(ref _frameDispatcher, null)?.Dispose();
 
             if (_udpClientsMap.Count != 0)
                 foreach (Socket client in _udpClientsMap.Values)
@@ -402,11 +409,13 @@ namespace RtspClientSharp.Rtsp
             }
             else
             {
-                rtpSequenceAssembler = new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256);
+                rtpSequenceAssembler = new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256,
+                    track.Codec is VideoCodecInfo);
                 mediaPayloadParser.FrameGenerated = OnFrameGeneratedThreadSafe;
             }
 
-            var rtpStream = new RtpStream(mediaPayloadParser, track.SamplesFrequency, rtpSequenceAssembler);
+            var rtpStream = new RtpStream(mediaPayloadParser, track.SamplesFrequency, rtpSequenceAssembler,
+                track.Codec is VideoCodecInfo && _connectionParameters.RtpTransport != RtpTransportProtocol.TCP);
             _streamsMap.Add(rtpChannelNumber, rtpStream);
 
             var rtcpStream = new RtcpStream();
@@ -593,14 +602,58 @@ namespace RtspClientSharp.Rtsp
         private void OnFrameGeneratedLockfree(RawFrame frame)
         {
             RaiseRawFrameGenerated(frame);
-            _frameDispatcher.TryEnqueue(frame);
+            DispatchFrame(frame);
         }
 
         private void OnFrameGeneratedThreadSafe(RawFrame frame)
         {
             RaiseRawFrameGenerated(frame);
-            _frameDispatcher.TryEnqueue(frame);
+            DispatchFrame(frame);
         }
+
+        private void DispatchFrame(RawFrame frame)
+        {
+            if (UseInlineFrameDelivery)
+            {
+                try
+                {
+                    FrameReceived?.Invoke(frame);
+                }
+                catch (Exception exception)
+                {
+                    // Keep an inline consumer from terminating the RTSP parser.
+                    Debug.WriteLine(exception);
+                }
+
+                return;
+            }
+
+			RawFrameDispatcher frameDispatcher = GetFrameDispatcher();
+			frameDispatcher?.TryEnqueue(frame);
+		}
+
+		private RawFrameDispatcher GetFrameDispatcher()
+		{
+			if (Volatile.Read(ref _disposed) != 0)
+				return null;
+
+			RawFrameDispatcher frameDispatcher = Volatile.Read(ref _frameDispatcher);
+			if (frameDispatcher != null)
+				return frameDispatcher;
+
+			var newFrameDispatcher = new RawFrameDispatcher(frame => FrameReceived?.Invoke(frame));
+			if (Volatile.Read(ref _disposed) != 0)
+			{
+				newFrameDispatcher.Dispose();
+				return null;
+			}
+
+			frameDispatcher = Interlocked.CompareExchange(ref _frameDispatcher, newFrameDispatcher, null);
+			if (frameDispatcher != null)
+				newFrameDispatcher.Dispose();
+
+			return frameDispatcher ?? newFrameDispatcher;
+		}
 
         private void RaiseRawFrameGenerated(RawFrame frame)
         {
@@ -683,7 +736,7 @@ namespace RtspClientSharp.Rtsp
             RtcpReceiverReportsProvider reportsProvider,
             CancellationToken token)
         {
-            var readBuffer = new byte[Constants.UdpReceiveBufferSize];
+            var readBuffer = new byte[Constants.UdpReceiveBufferSize + RawVideoFramePadding.Size];
             var bufferSegment = new ArraySegment<byte>(readBuffer);
 
             int nextRtcpReportInterval = GetNextRtcpReportIntervalMs();

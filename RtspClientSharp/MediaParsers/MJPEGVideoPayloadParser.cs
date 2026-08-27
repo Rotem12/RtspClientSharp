@@ -416,10 +416,14 @@ namespace RtspClientSharp.MediaParsers
                 _frameStream.Write(JpegEndMarkerByteSegment.Array, JpegEndMarkerByteSegment.Offset, JpegEndMarkerByteSegment.Count);
 
             DateTime timestamp = GetFrameTimestamp(timeOffset);
+            RawVideoFramePadding.Ensure(_frameStream);
             var frameBytes = new ArraySegment<byte>(_frameStream.GetBuffer(), 0, (int)_frameStream.Position);
             _frameStream.Position = 0;
 
-            var frame = new RawJpegFrame(timestamp, frameBytes);
+            var frame = new RawJpegFrame(timestamp, frameBytes)
+            {
+                HasDecoderInputPadding = RawVideoFramePadding.IsZeroed(frameBytes)
+            };
             OnFrameGenerated(frame);
         }
     }

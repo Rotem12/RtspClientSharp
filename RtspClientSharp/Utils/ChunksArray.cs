@@ -11,6 +11,8 @@ namespace RtspClientSharp.Utils
     {
         private readonly int _maxChunkSize;
         private readonly int _maxNumberOfChunks;
+        private readonly int _chunkStride;
+        private readonly int _trailingPaddingSize;
         private byte[] _chunksBytes = Array.Empty<byte>();
         private readonly List<int> _sizesList;
         private readonly Stack<int> _freeChunks;
@@ -18,10 +20,19 @@ namespace RtspClientSharp.Utils
 
         public int Count => _chunksCount;
 
-        public ChunksArray(int maxChunkSize, int maxNumberOfChunks)
+        public ChunksArray(int maxChunkSize, int maxNumberOfChunks, int trailingPaddingSize = 0)
         {
+            if (maxChunkSize <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxChunkSize));
+            if (maxNumberOfChunks <= 0)
+                throw new ArgumentOutOfRangeException(nameof(maxNumberOfChunks));
+            if (trailingPaddingSize < 0)
+                throw new ArgumentOutOfRangeException(nameof(trailingPaddingSize));
+
             _maxChunkSize = maxChunkSize;
             _maxNumberOfChunks = maxNumberOfChunks;
+            _trailingPaddingSize = trailingPaddingSize;
+            _chunkStride = checked(maxChunkSize + trailingPaddingSize);
             _sizesList = new List<int>(maxNumberOfChunks);
             _freeChunks = new Stack<int>(maxNumberOfChunks);
         }
@@ -30,7 +41,7 @@ namespace RtspClientSharp.Utils
         {
             get
             {
-                int offset = index * _maxChunkSize;
+                int offset = index * _chunkStride;
                 return new ArraySegment<byte>(_chunksBytes, offset, _sizesList[index]);
             }
         }
@@ -50,7 +61,7 @@ namespace RtspClientSharp.Utils
             if (_freeChunks.Count != 0)
             {
                 index = _freeChunks.Pop();
-                offset = index * _maxChunkSize;
+                offset = index * _chunkStride;
 
                 _sizesList[index] = chunkSegment.Count;
                 ++_chunksCount;
@@ -59,17 +70,19 @@ namespace RtspClientSharp.Utils
             {
                 index = _chunksCount;
 
-                int requiredSize = ++_chunksCount * _maxChunkSize;
+                int requiredSize = ++_chunksCount * _chunkStride;
 
                 if (_chunksBytes.Length < requiredSize)
                     Array.Resize(ref _chunksBytes, requiredSize);
 
-                offset = requiredSize - _maxChunkSize;
+                offset = requiredSize - _chunkStride;
 
                 _sizesList.Add(chunkSegment.Count);
             }
 
             Buffer.BlockCopy(chunkSegment.Array, chunkSegment.Offset, _chunksBytes, offset, chunkSegment.Count);
+            if (_trailingPaddingSize != 0)
+                Array.Clear(_chunksBytes, offset + chunkSegment.Count, _trailingPaddingSize);
             return index;
         }
 

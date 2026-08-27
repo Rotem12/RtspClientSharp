@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Utils;
 
 namespace RtspClientSharp.Rtp
@@ -17,7 +18,8 @@ namespace RtspClientSharp.Rtp
 
         public RefAction<RtpPacket> PacketPassed { get; set; }
 
-        public RtpSequenceAssembler(int maxRtpPacketSize, int maxCorrectionLength)
+        public RtpSequenceAssembler(int maxRtpPacketSize, int maxCorrectionLength,
+            bool ensureVideoInputPadding = false)
         {
             if (maxRtpPacketSize <= 0)
                 throw new ArgumentOutOfRangeException(nameof(maxRtpPacketSize));
@@ -25,7 +27,8 @@ namespace RtspClientSharp.Rtp
                 throw new ArgumentOutOfRangeException(nameof(maxCorrectionLength));
 
             _maxCorrectionLength = maxCorrectionLength;
-            _chunksArray = new ChunksArray(maxRtpPacketSize, maxCorrectionLength);
+            _chunksArray = new ChunksArray(maxRtpPacketSize, maxCorrectionLength,
+                ensureVideoInputPadding ? RawVideoFramePadding.Size : 0);
 
             _bufferedRtpPackets = new List<RtpPacket>(maxCorrectionLength);
             _removeList = new List<int>(maxCorrectionLength);

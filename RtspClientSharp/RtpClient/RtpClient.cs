@@ -9,6 +9,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using RtspClientSharp.MediaParsers;
 using RtspClientSharp.RawFrames;
+using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Rtp;
 using RtspClientSharp.Rtsp;
 using RtspClientSharp.Ts;
@@ -24,9 +25,18 @@ namespace RtspClientSharp.RtpClient
         private long _receivedDatagramCount;
         private long _generatedFrameCount;
         private long _dispatcherDroppedFrameCount;
-        private readonly byte[] _receiveBuffer = new byte[Constants.UdpReceiveBufferSize];
+        private readonly byte[] _receiveBuffer =
+            new byte[Constants.UdpReceiveBufferSize + RawVideoFramePadding.Size];
         public ConnectionParameters ConnectionParameters { get; }
         public int Timeout { get; set; } = 3000;
+
+        /// <summary>
+        /// Delivers each generated frame on the receive/parser call stack instead
+        /// of copying it to the bounded display dispatcher. Enable this only when
+        /// subscribers consume the frame synchronously before returning. The
+        /// WinForms control enables it for its private transport client.
+        /// </summary>
+        public bool UseInlineFrameDelivery { get; set; }
 
         public event Action<RawFrame> RawFrameReceived;
         public event EventHandler<RawFrame> RawFrameGenerated;
@@ -37,10 +47,17 @@ namespace RtspClientSharp.RtpClient
         /// This is <see cref="MediaTransportMode.Auto"/> until the first datagram
         /// is classified.
         /// </summary>
-        public MediaTransportMode DetectedTransportMode =>
-            stream is AutoDetectingTransportStream autoStream
-                ? autoStream.DetectedMode
-                : MediaTransportMode.Auto;
+        public MediaTransportMode DetectedTransportMode
+        {
+            get
+            {
+                ITransportStream currentStream = stream;
+                if (currentStream is AutoDetectingTransportStream autoStream)
+                    return autoStream.DetectedMode;
+
+                return (MediaTransportMode)Volatile.Read(ref _detectedTransportMode);
+            }
+        }
         /// <summary>
         /// Optional Annex-B SPS/PPS bytes for a direct RTP H.264 stream. Direct RTP has no
         /// SDP exchange, so this must be supplied when the sender does not repeat them in-band.
@@ -54,19 +71,14 @@ namespace RtspClientSharp.RtpClient
         public long DispatcherDroppedFrameCount => Interlocked.Read(ref _dispatcherDroppedFrameCount);
 
         private ITransportStream stream;
-        private readonly RawFrameDispatcher _frameDispatcher;
+        private RawFrameDispatcher _frameDispatcher;
+        private int _detectedTransportMode = (int)MediaTransportMode.Auto;
 
         public RtpClient(ConnectionParameters connectionParameters)
         {
             ConnectionParameters = connectionParameters ??
                                    throw new ArgumentNullException(nameof(connectionParameters));
 
-            RawFrameReceived = frame =>
-            {
-                FrameReceived?.Invoke(this, frame);
-            };
-
-            _frameDispatcher = new RawFrameDispatcher(frame => RawFrameReceived?.Invoke(frame));
         }
 
         ~RtpClient()
@@ -155,15 +167,30 @@ namespace RtspClientSharp.RtpClient
             IMediaPayloadParser mediaPayloadParser = MediaPayloadParser.CreateFrom(info);
 
             IRtpSequenceAssembler rtpSequenceAssembler =
-                new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256);
+                new RtpSequenceAssembler(Constants.UdpReceiveBufferSize, 256, true);
             mediaPayloadParser.FrameGenerated = OnFrameGeneratedThreadSafe;
 
             Func<ITransportStream> rtpStreamFactory = () =>
-                new RtpStream(mediaPayloadParser, 90000, rtpSequenceAssembler);
+                new RtpStream(mediaPayloadParser, 90000, rtpSequenceAssembler, true);
             Func<ITransportStream> mpegTsStreamFactory = () => new TsStream(mediaPayloadParser);
 
-            stream = new AutoDetectingTransportStream(ConnectionParameters.TransportMode,
-                rtpStreamFactory, mpegTsStreamFactory);
+            switch (ConnectionParameters.TransportMode)
+            {
+                case MediaTransportMode.Rtp:
+                    stream = rtpStreamFactory();
+                    Volatile.Write(ref _detectedTransportMode, (int)MediaTransportMode.Rtp);
+                    break;
+                case MediaTransportMode.MpegTs:
+                    stream = mpegTsStreamFactory();
+                    Volatile.Write(ref _detectedTransportMode, (int)MediaTransportMode.MpegTs);
+                    break;
+                case MediaTransportMode.Auto:
+                    stream = new AutoDetectingTransportStream(MediaTransportMode.Auto,
+                        rtpStreamFactory, mpegTsStreamFactory);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(ConnectionParameters.TransportMode));
+            }
 
             return Task.CompletedTask;
         }
@@ -173,11 +200,81 @@ namespace RtspClientSharp.RtpClient
             int bytesRead = await _rtpClient.Client.ReceiveAsync(
                 new ArraySegment<byte>(_receiveBuffer), SocketFlags.None).ConfigureAwait(false);
 
+            ProcessReceivedDatagram(bytesRead);
+        }
+
+        private void ProcessReceivedDatagram(int bytesRead)
+        {
             if (bytesRead == 0)
                 return;
 
             Interlocked.Increment(ref _receivedDatagramCount);
             stream.Process(new ArraySegment<byte>(_receiveBuffer, 0, bytesRead));
+        }
+
+        /// <summary>
+        /// Receives direct UDP media until cancelled or the endpoint is idle for
+        /// <see cref="Timeout"/> milliseconds. Unlike the legacy one-read API, this
+        /// keeps one blocking receive loop and one watchdog alive for the whole
+        /// session instead of allocating an async socket task for every datagram.
+        /// </summary>
+        public Task ReceiveLoopAsync(CancellationToken token)
+        {
+            if (_rtpClient == null)
+                throw new InvalidOperationException("Client should be connected first");
+
+            return Task.Factory.StartNew(() => ReceiveLoopBlocking(token), CancellationToken.None,
+                TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        private void ReceiveLoopBlocking(CancellationToken token)
+        {
+            if (_rtpClient == null)
+                throw new InvalidOperationException("Client should be connected first");
+
+            Socket socket = _rtpClient.Client;
+            socket.ReceiveTimeout = Math.Max(1, Timeout);
+
+            using (token.Register(() =>
+            {
+                try
+                {
+                    socket.Close();
+                }
+                catch
+                {
+                    // Closing the socket is only used to wake Socket.Receive.
+                }
+            }))
+            {
+                try
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        int bytesRead = socket.Receive(_receiveBuffer, 0, _receiveBuffer.Length,
+                            SocketFlags.None);
+
+                        ProcessReceivedDatagram(bytesRead);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    if (token.IsCancellationRequested)
+                        throw new OperationCanceledException(token);
+
+                    if (exception is SocketException socketException &&
+                        socketException.SocketErrorCode == SocketError.TimedOut)
+                    {
+                        throw new RtspClientException("Receive timeout", new TimeoutException());
+                    }
+
+                    throw new RtspClientException("Receive error", exception);
+                }
+            }
         }
 
         /// <summary>
@@ -257,7 +354,7 @@ namespace RtspClientSharp.RtpClient
             if (Interlocked.CompareExchange(ref _disposed, 1, 0) != 0)
                 return;
 
-            _frameDispatcher.Dispose();
+            Interlocked.Exchange(ref _frameDispatcher, null)?.Dispose();
             _rtpClient?.Dispose();
 
             GC.SuppressFinalize(this);
@@ -347,14 +444,63 @@ namespace RtspClientSharp.RtpClient
         private void OnFrameGeneratedThreadSafe(RawFrame frame)
         {
             Interlocked.Increment(ref _generatedFrameCount);
-            if (RawFrameReceived == null)
+            // RawFrame segments point into parser storage that is reused for the next
+            // frame. The normal path copies before dispatch; the inline path invokes the
+            // consumer before the parser can reuse that storage.
+            if (RawFrameGenerated != null)
+                RaiseRawFrameGenerated(frame);
+
+            if (UseInlineFrameDelivery)
+            {
+                try
+                {
+                    DispatchFrameToSubscribers(frame);
+                }
+                catch (Exception exception)
+                {
+                    // Keep inline consumers from terminating the receive/parser path,
+                    // matching the protection used by RawFrameDispatcher.
+                    Debug.WriteLine(exception);
+                }
+
+                return;
+            }
+
+            if (RawFrameReceived == null && FrameReceived == null)
                 return;
 
-            // Copy and dispatch outside the receive thread. FrameSegment points into parser
-            // storage that is reused for the next frame, so the dispatcher owns the copy.
-            RaiseRawFrameGenerated(frame);
-            if (!_frameDispatcher.TryEnqueue(frame))
+            RawFrameDispatcher frameDispatcher = GetFrameDispatcher();
+            if (frameDispatcher == null || !frameDispatcher.TryEnqueue(frame))
                 Interlocked.Increment(ref _dispatcherDroppedFrameCount);
+        }
+
+        private RawFrameDispatcher GetFrameDispatcher()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return null;
+
+            RawFrameDispatcher frameDispatcher = Volatile.Read(ref _frameDispatcher);
+            if (frameDispatcher != null)
+                return frameDispatcher;
+
+            var newFrameDispatcher = new RawFrameDispatcher(DispatchFrameToSubscribers);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                newFrameDispatcher.Dispose();
+                return null;
+            }
+
+            frameDispatcher = Interlocked.CompareExchange(ref _frameDispatcher, newFrameDispatcher, null);
+            if (frameDispatcher != null)
+                newFrameDispatcher.Dispose();
+
+            return frameDispatcher ?? newFrameDispatcher;
+        }
+
+        private void DispatchFrameToSubscribers(RawFrame frame)
+        {
+            RawFrameReceived?.Invoke(frame);
+            FrameReceived?.Invoke(this, frame);
         }
 
         private void RaiseRawFrameGenerated(RawFrame frame)

@@ -25,6 +25,11 @@ namespace RtspClientSharp.UnitTests.Utils
                 Assert.IsFalse(ReferenceEquals(spsPpsBytes, copiedIFrame.SpsPpsSegment.Array));
                 Assert.IsTrue(copiedIFrame.FrameSegment.SequenceEqual(frameBytes));
                 Assert.IsTrue(copiedIFrame.SpsPpsSegment.SequenceEqual(spsPpsBytes));
+                Assert.IsTrue(copiedIFrame.HasDecoderInputPadding);
+                int paddingStart = copiedIFrame.FrameSegment.Offset + copiedIFrame.FrameSegment.Count;
+                int paddingEnd = paddingStart + 64;
+                for (int i = paddingStart; i < paddingEnd; i++)
+                    Assert.AreEqual(0, copiedIFrame.FrameSegment.Array[i]);
 
                 frameBytes[4] = 0;
                 spsPpsBytes[4] = 0;

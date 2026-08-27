@@ -32,7 +32,7 @@ namespace RtspClientSharp.MediaParsers
         public H265Parser(Func<DateTime> frameTimestampProvider)
         {
             _frameTimestampProvider = frameTimestampProvider ?? throw new ArgumentException(nameof(frameTimestampProvider));
-            _frameStream = new MemoryStream(8 * 1024);
+            _frameStream = new MemoryStream(128 * 1024);
         }
 
         public void Parse(ArraySegment<byte> byteSegment, bool generateFrame)
@@ -54,6 +54,7 @@ namespace RtspClientSharp.MediaParsers
             if (_frameStream.Position == 0)
                 return;
 
+            RawVideoFramePadding.Ensure(_frameStream);
             var frameBytes = new ArraySegment<byte>(_frameStream.GetBuffer(), 0, (int)_frameStream.Position);
             _frameStream.Position = 0;
             TryGenerateFrame(frameBytes);
@@ -81,7 +82,11 @@ namespace RtspClientSharp.MediaParsers
             if (frameType == HevcFrameType.PredictionFrame && !_waitForIFrame)
             {
                 frameTimestamp = _frameTimestampProvider();
-                FrameGenerated?.Invoke(new RawH265PFrame(frameTimestamp, frameBytes));
+                var frame = new RawH265PFrame(frameTimestamp, frameBytes)
+                {
+                    HasDecoderInputPadding = RawVideoFramePadding.IsZeroed(frameBytes)
+                };
+                FrameGenerated?.Invoke(frame);
                 return;
             }
 
@@ -92,7 +97,11 @@ namespace RtspClientSharp.MediaParsers
             var parametersBytesSegment = new ArraySegment<byte>(_parametersBytes);
 
             frameTimestamp = _frameTimestampProvider();
-            FrameGenerated?.Invoke(new RawH265IFrame(frameTimestamp, frameBytes, parametersBytesSegment));
+            var intraFrame = new RawH265IFrame(frameTimestamp, frameBytes, parametersBytesSegment)
+            {
+                HasDecoderInputPadding = RawVideoFramePadding.IsZeroed(frameBytes)
+            };
+            FrameGenerated?.Invoke(intraFrame);
         }
 
         public void ResetState()

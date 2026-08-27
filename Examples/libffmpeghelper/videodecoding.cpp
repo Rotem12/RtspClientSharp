@@ -25,6 +25,8 @@ struct VideoDecoderContext
 	ID3D11Texture2D *shader_texture;
 	ID3D11ShaderResourceView *shader_resource_view_y;
 	ID3D11ShaderResourceView *shader_resource_view_uv;
+	ID3D11ShaderResourceView *source_shader_resource_view_y;
+	ID3D11ShaderResourceView *source_shader_resource_view_uv;
 	DXGI_FORMAT shader_texture_format;
 	int shader_texture_width;
 	int shader_texture_height;
@@ -38,6 +40,8 @@ struct VideoDecoderContext
 	float crop_top;
 	float crop_right;
 	float crop_bottom;
+	UINT crop_array_slice;
+	bool source_shader_resource_views_valid;
 };
 
 struct RenderCropConstants
@@ -46,6 +50,8 @@ struct RenderCropConstants
 	float crop_top;
 	float crop_right;
 	float crop_bottom;
+	UINT array_slice;
+	UINT padding[3];
 };
 
 struct ScalerContext
@@ -62,10 +68,18 @@ struct ScalerContext
 };
 
 static int prepare_padded_decoder_packet(VideoDecoderContext *context, void *rawBuffer,
-	int rawBufferLength, AVPacket *packet)
+	int rawBufferLength, AVPacket *packet, bool rawBufferAlreadyPadded)
 {
 	if (!context || !rawBuffer || rawBufferLength <= 0 || !packet)
 		return -1;
+
+	if (rawBufferAlreadyPadded)
+	{
+		av_init_packet(packet);
+		packet->data = static_cast<uint8_t *>(rawBuffer);
+		packet->size = rawBufferLength;
+		return 0;
+	}
 
 	const size_t paddedLength = static_cast<size_t>(rawBufferLength) + AV_INPUT_BUFFER_PADDING_SIZE;
 	if (paddedLength > (std::numeric_limits<unsigned int>::max)())
@@ -88,6 +102,16 @@ static void release_render_resources(VideoDecoderContext *context)
 {
 	if (!context)
 		return;
+
+	if (context->render_target_view && context->hw_device_ctx)
+	{
+		auto deviceContext = reinterpret_cast<AVHWDeviceContext *>(context->hw_device_ctx->data);
+		auto d3d11Context = deviceContext
+			? static_cast<AVD3D11VADeviceContext *>(deviceContext->hwctx)
+			: nullptr;
+		if (d3d11Context && d3d11Context->device_context)
+			d3d11Context->device_context->OMSetRenderTargets(0, nullptr, nullptr);
+	}
 
 	if (context->render_target_view)
 	{
@@ -143,6 +167,18 @@ static void release_render_resources(VideoDecoderContext *context)
 		context->shader_resource_view_uv = nullptr;
 	}
 
+	if (context->source_shader_resource_view_y)
+	{
+		context->source_shader_resource_view_y->Release();
+		context->source_shader_resource_view_y = nullptr;
+	}
+
+	if (context->source_shader_resource_view_uv)
+	{
+		context->source_shader_resource_view_uv->Release();
+		context->source_shader_resource_view_uv = nullptr;
+	}
+
 	context->shader_texture_format = DXGI_FORMAT_UNKNOWN;
 	context->shader_texture_width = 0;
 	context->shader_texture_height = 0;
@@ -152,6 +188,8 @@ static void release_render_resources(VideoDecoderContext *context)
 	context->source_texture_desc = {};
 	context->source_texture_desc_valid = false;
 	context->crop_constants_valid = false;
+	context->crop_array_slice = 0;
+	context->source_shader_resource_views_valid = false;
 }
 
 static int compile_shader(const char *source, const char *entryPoint, const char *target, ID3DBlob **blob)
@@ -172,25 +210,27 @@ static int ensure_render_shaders(VideoDecoderContext *context, ID3D11Device *dev
 		return 0;
 
 	const char *vertexShaderSource =
-		"cbuffer CropBuffer : register(b0) { float4 crop; };"
-		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"cbuffer CropBuffer : register(b0) { float4 crop; uint arraySlice; uint3 padding; };"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; nointerpolation uint arraySlice : TEXCOORD1; };"
 		"VSOut main(uint id : SV_VertexID) {"
 		"  float2 pos[3] = { float2(-1.0,-1.0), float2(-1.0,3.0), float2(3.0,-1.0) };"
 		"  float2 uv[3] = { float2(0.0,1.0), float2(0.0,-1.0), float2(2.0,1.0) };"
 		"  VSOut output;"
 		"  output.pos = float4(pos[id], 0.0, 1.0);"
 		"  output.uv = float2(lerp(crop.x, 1.0 - crop.z, uv[id].x), lerp(crop.y, 1.0 - crop.w, uv[id].y));"
+		"  output.arraySlice = arraySlice;"
 		"  return output;"
 		"}";
 
 	const char *pixelShaderSource =
-		"Texture2D texY : register(t0);"
-		"Texture2D texUV : register(t1);"
+		"Texture2DArray texY : register(t0);"
+		"Texture2DArray texUV : register(t1);"
 		"SamplerState samp : register(s0);"
-		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
+		"struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; nointerpolation uint arraySlice : TEXCOORD1; };"
 		"float4 main(VSOut input) : SV_TARGET {"
-		"  float y = texY.Sample(samp, input.uv).r;"
-		"  float2 uv = texUV.Sample(samp, input.uv).rg - float2(0.5, 0.5);"
+		"  float3 sampleLocation = float3(input.uv, input.arraySlice);"
+		"  float y = texY.Sample(samp, sampleLocation).r;"
+		"  float2 uv = texUV.Sample(samp, sampleLocation).rg - float2(0.5, 0.5);"
 		"  float r = y + 1.5748 * uv.y;"
 		"  float g = y - 0.1873 * uv.x - 0.4681 * uv.y;"
 		"  float b = y + 1.8556 * uv.x;"
@@ -247,7 +287,8 @@ static int ensure_render_shaders(VideoDecoderContext *context, ID3D11Device *dev
 	return SUCCEEDED(hr) ? 0 : -6;
 }
 
-static int ensure_swap_chain(VideoDecoderContext *context, ID3D11Device *device)
+static int ensure_swap_chain(VideoDecoderContext *context, ID3D11Device *device,
+	ID3D11DeviceContext *immediateContext)
 {
 	if (!context->render_hwnd)
 		return -1;
@@ -262,6 +303,12 @@ static int ensure_swap_chain(VideoDecoderContext *context, ID3D11Device *device)
 
 	if (context->render_target_view)
 	{
+		// ResizeBuffers requires every view of the swap-chain back buffer to
+		// be unbound before the last reference is released. The previous frame
+		// leaves this RTV attached to the output-merger, which can make a
+		// fullscreen resize fail with DXGI_ERROR_INVALID_CALL forever.
+		if (immediateContext)
+			immediateContext->OMSetRenderTargets(0, nullptr, nullptr);
 		context->render_target_view->Release();
 		context->render_target_view = nullptr;
 	}
@@ -394,9 +441,11 @@ static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *dev
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC yDesc = {};
 	yDesc.Format = yFormat;
-	yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	yDesc.Texture2D.MostDetailedMip = 0;
-	yDesc.Texture2D.MipLevels = 1;
+	yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+	yDesc.Texture2DArray.MostDetailedMip = 0;
+	yDesc.Texture2DArray.MipLevels = 1;
+	yDesc.Texture2DArray.FirstArraySlice = 0;
+	yDesc.Texture2DArray.ArraySize = 1;
 
 	D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc = yDesc;
 	uvDesc.Format = uvFormat;
@@ -410,6 +459,84 @@ static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *dev
 	context->shader_texture_width = static_cast<int>(sourceDesc.Width);
 	context->shader_texture_height = static_cast<int>(sourceDesc.Height);
 	context->shader_texture_format = sourceDesc.Format;
+	return 0;
+}
+
+static int ensure_source_shader_views(VideoDecoderContext *context, ID3D11Device *device,
+	ID3D11Texture2D *sourceTexture, const D3D11_TEXTURE2D_DESC &sourceDesc)
+{
+	if (!context || !device || !sourceTexture ||
+		(sourceDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
+		(sourceDesc.Format != DXGI_FORMAT_NV12 && sourceDesc.Format != DXGI_FORMAT_P010 &&
+		 sourceDesc.Format != DXGI_FORMAT_P016))
+		return -1;
+
+	if (context->source_shader_resource_views_valid &&
+		context->source_texture == sourceTexture &&
+		context->source_texture_desc.Width == sourceDesc.Width &&
+		context->source_texture_desc.Height == sourceDesc.Height &&
+		context->source_texture_desc.ArraySize == sourceDesc.ArraySize &&
+		context->source_texture_desc.Format == sourceDesc.Format)
+		return 0;
+
+	if (context->source_shader_resource_view_y)
+	{
+		context->source_shader_resource_view_y->Release();
+		context->source_shader_resource_view_y = nullptr;
+	}
+
+	if (context->source_shader_resource_view_uv)
+	{
+		context->source_shader_resource_view_uv->Release();
+		context->source_shader_resource_view_uv = nullptr;
+	}
+
+	DXGI_FORMAT yFormat = DXGI_FORMAT_UNKNOWN;
+	DXGI_FORMAT uvFormat = DXGI_FORMAT_UNKNOWN;
+	if (sourceDesc.Format == DXGI_FORMAT_NV12)
+	{
+		yFormat = DXGI_FORMAT_R8_UNORM;
+		uvFormat = DXGI_FORMAT_R8G8_UNORM;
+	}
+	else
+	{
+		yFormat = DXGI_FORMAT_R16_UNORM;
+		uvFormat = DXGI_FORMAT_R16G16_UNORM;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC yDesc = {};
+	yDesc.Format = yFormat;
+	if (sourceDesc.ArraySize > 1)
+	{
+		yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+		yDesc.Texture2DArray.MostDetailedMip = 0;
+		yDesc.Texture2DArray.MipLevels = 1;
+		yDesc.Texture2DArray.FirstArraySlice = 0;
+		yDesc.Texture2DArray.ArraySize = sourceDesc.ArraySize;
+	}
+	else
+	{
+		yDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		yDesc.Texture2D.MostDetailedMip = 0;
+		yDesc.Texture2D.MipLevels = 1;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC uvDesc = yDesc;
+	uvDesc.Format = uvFormat;
+
+	if (FAILED(device->CreateShaderResourceView(sourceTexture, &yDesc,
+		&context->source_shader_resource_view_y)))
+		return -2;
+
+	if (FAILED(device->CreateShaderResourceView(sourceTexture, &uvDesc,
+		&context->source_shader_resource_view_uv)))
+	{
+		context->source_shader_resource_view_y->Release();
+		context->source_shader_resource_view_y = nullptr;
+		return -3;
+	}
+
+	context->source_shader_resource_views_valid = true;
 	return 0;
 }
 
@@ -589,6 +716,45 @@ static int ensure_shader_texture(VideoDecoderContext *context, ID3D11Device *dev
 //	texture->Release();
 //}
 
+static int configure_d3d11va_shader_frames(AVCodecContext *avctx, VideoDecoderContext *context)
+{
+	if (!avctx || !context || !context->hw_device_ctx || context->hw_pixel_format == AV_PIX_FMT_NONE)
+		return -1;
+
+	AVBufferRef *framesReference = nullptr;
+	int result = avcodec_get_hw_frames_parameters(avctx, context->hw_device_ctx,
+		context->hw_pixel_format, &framesReference);
+	if (result < 0 || !framesReference)
+		return result < 0 ? result : -2;
+
+	AVHWFramesContext *framesContext = reinterpret_cast<AVHWFramesContext *>(framesReference->data);
+	AVD3D11VAFramesContext *d3d11FramesContext = framesContext
+		? static_cast<AVD3D11VAFramesContext *>(framesContext->hwctx)
+		: nullptr;
+	if (!d3d11FramesContext)
+	{
+		av_buffer_unref(&framesReference);
+		return -3;
+	}
+
+	// FFmpeg's default D3D11VA pool is decoder-only. Adding the shader binding
+	// allows the renderer to sample the decoder surface directly and avoids a
+	// full-frame CopySubresourceRegion on every presented frame.
+	d3d11FramesContext->BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+	result = av_hwframe_ctx_init(framesReference);
+	if (result < 0)
+	{
+		av_buffer_unref(&framesReference);
+		return result;
+	}
+
+	avctx->hw_frames_ctx = framesReference;
+	av_log(avctx, AV_LOG_INFO,
+		"RtspClientSharp D3D11VA shader-readable frame pool active: bind_flags=0x%x array_pool=%d\n",
+		d3d11FramesContext->BindFlags, framesContext->initial_pool_size);
+	return 0;
+}
+
 static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *pixel_formats)
 {
 	const auto context = static_cast<VideoDecoderContext *>(avctx->opaque);
@@ -616,7 +782,13 @@ static AVPixelFormat get_hw_format(AVCodecContext *avctx, const AVPixelFormat *p
 		for (const AVPixelFormat *format = pixel_formats; *format != AV_PIX_FMT_NONE; format++)
 		{
 			if (*format == context->hw_pixel_format)
+			{
+				if (configure_d3d11va_shader_frames(avctx, context) < 0)
+					av_log(avctx, AV_LOG_INFO,
+						"RtspClientSharp D3D11VA shader-readable frame pool unavailable; using copy renderer\n");
+
 				return *format;
+			}
 		}
 
 		// FFmpeg may accept the decoder while selecting a software format after
@@ -822,7 +994,8 @@ int set_video_decoder_extradata(void *handle, void *extradata, int extradataLeng
 	return 0;
 }
 
-int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *frameWidth, int *frameHeight, int *framePixelFormat)
+static int decode_video_frame_internal(void *handle, void *rawBuffer, int rawBufferLength,
+	int *frameWidth, int *frameHeight, int *framePixelFormat, bool rawBufferAlreadyPadded)
 {
 #if _DEBUG
 	if (!handle || !rawBuffer || !rawBufferLength || !frameWidth || !frameHeight || !framePixelFormat)
@@ -839,7 +1012,8 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 	context->active_frame = nullptr;
 
 	AVPacket packet;
-	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet) < 0)
+	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet,
+		rawBufferAlreadyPadded) < 0)
 		return -6;
 
 	int len = avcodec_send_packet(context->av_codec_context, &packet);
@@ -872,6 +1046,19 @@ int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *
 	return 0;
 }
 
+int decode_video_frame(void *handle, void *rawBuffer, int rawBufferLength, int *frameWidth, int *frameHeight, int *framePixelFormat)
+{
+	return decode_video_frame_internal(handle, rawBuffer, rawBufferLength, frameWidth, frameHeight,
+		framePixelFormat, false);
+}
+
+int decode_video_frame_padded(void *handle, void *rawBuffer, int rawBufferLength,
+	int *frameWidth, int *frameHeight, int *framePixelFormat)
+{
+	return decode_video_frame_internal(handle, rawBuffer, rawBufferLength, frameWidth, frameHeight,
+		framePixelFormat, true);
+}
+
 int set_video_decoder_render_target(void *handle, void *hwnd)
 {
 	if (!handle)
@@ -888,7 +1075,8 @@ int set_video_decoder_render_target(void *handle, void *hwnd)
 	return context->render_hwnd ? 0 : -2;
 }
 
-int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength, int *frameWidth, int *frameHeight, int *framePixelFormat)
+static int decode_video_frame_to_gpu_internal(void *handle, void *rawBuffer, int rawBufferLength,
+	int *frameWidth, int *frameHeight, int *framePixelFormat, bool rawBufferAlreadyPadded)
 {
 #if _DEBUG
 	if (!handle || !rawBuffer || !rawBufferLength || !frameWidth || !frameHeight || !framePixelFormat)
@@ -901,11 +1089,11 @@ int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength
 		return -2;
 
 	av_frame_unref(context->frame);
-	av_frame_unref(context->software_frame);
 	context->active_frame = nullptr;
 
 	AVPacket packet;
-	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet) < 0)
+	if (prepare_padded_decoder_packet(context, rawBuffer, rawBufferLength, &packet,
+		rawBufferAlreadyPadded) < 0)
 		return -6;
 
 	int len = avcodec_send_packet(context->av_codec_context, &packet);
@@ -927,6 +1115,20 @@ int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength
 	*framePixelFormat = context->active_frame->format;
 
 	return 0;
+}
+
+int decode_video_frame_to_gpu(void *handle, void *rawBuffer, int rawBufferLength,
+	int *frameWidth, int *frameHeight, int *framePixelFormat)
+{
+	return decode_video_frame_to_gpu_internal(handle, rawBuffer, rawBufferLength, frameWidth,
+		frameHeight, framePixelFormat, false);
+}
+
+int decode_video_frame_to_gpu_padded(void *handle, void *rawBuffer, int rawBufferLength,
+	int *frameWidth, int *frameHeight, int *framePixelFormat)
+{
+	return decode_video_frame_to_gpu_internal(handle, rawBuffer, rawBufferLength, frameWidth,
+		frameHeight, framePixelFormat, true);
 }
 
 int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop, double cropRight, double cropBottom)
@@ -955,7 +1157,7 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 	if (result != 0)
 		return -10 + result;
 
-	result = ensure_swap_chain(context, device);
+	result = ensure_swap_chain(context, device, immediateContext);
 	if (result != 0)
 		return -20 + result;
 
@@ -983,22 +1185,37 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 		textureDesc.Format != DXGI_FORMAT_P016)
 		return -8;
 
-	result = ensure_shader_texture(context, device, textureDesc);
-	if (result != 0)
-		return -30 + result;
+	if (arraySlice >= textureDesc.ArraySize)
+		return -9;
 
-	immediateContext->CopySubresourceRegion(context->shader_texture, 0, 0, 0, 0,
-		texture, D3D11CalcSubresource(0, arraySlice, 1), nullptr);
+	ID3D11ShaderResourceView *views[2] = {};
+	if (textureDesc.ArraySize > 1 &&
+		(textureDesc.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0 &&
+		ensure_source_shader_views(context, device, texture, textureDesc) == 0)
+	{
+		views[0] = context->source_shader_resource_view_y;
+		views[1] = context->source_shader_resource_view_uv;
+	}
+	else
+	{
+		result = ensure_shader_texture(context, device, textureDesc);
+		if (result != 0)
+			return -30 + result;
 
-	ID3D11ShaderResourceView *views[2] = { context->shader_resource_view_y, context->shader_resource_view_uv };
+		immediateContext->CopySubresourceRegion(context->shader_texture, 0, 0, 0, 0,
+			texture, D3D11CalcSubresource(0, arraySlice, 1), nullptr);
+		views[0] = context->shader_resource_view_y;
+		views[1] = context->shader_resource_view_uv;
+	}
 
 	const float nextCropLeft = static_cast<float>(cropLeft);
 	const float nextCropTop = static_cast<float>(cropTop);
 	const float nextCropRight = static_cast<float>(cropRight);
 	const float nextCropBottom = static_cast<float>(cropBottom);
+	const UINT nextArraySlice = arraySlice;
 	if (!context->crop_constants_valid || context->crop_left != nextCropLeft ||
 		context->crop_top != nextCropTop || context->crop_right != nextCropRight ||
-		context->crop_bottom != nextCropBottom)
+		context->crop_bottom != nextCropBottom || context->crop_array_slice != nextArraySlice)
 	{
 		D3D11_MAPPED_SUBRESOURCE mapped = {};
 		if (SUCCEEDED(immediateContext->Map(context->crop_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
@@ -1008,12 +1225,14 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 			constants->crop_top = nextCropTop;
 			constants->crop_right = nextCropRight;
 			constants->crop_bottom = nextCropBottom;
+			constants->array_slice = nextArraySlice;
 			immediateContext->Unmap(context->crop_buffer, 0);
 
 			context->crop_left = nextCropLeft;
 			context->crop_top = nextCropTop;
 			context->crop_right = nextCropRight;
 			context->crop_bottom = nextCropBottom;
+			context->crop_array_slice = nextArraySlice;
 			context->crop_constants_valid = true;
 		}
 	}
@@ -1025,6 +1244,12 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 	viewport.MaxDepth = 1.0f;
 
 	immediateContext->OMSetRenderTargets(1, &context->render_target_view, nullptr);
+	// DISCARD swap chains do not preserve back-buffer contents across Present
+	// or ResizeBuffers. Clear first so a partially composited frame can never
+	// expose stale/undefined pixels, which is most visible as a grey strip near
+	// the bottom edge during WinForms/DWM repainting.
+	const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	immediateContext->ClearRenderTargetView(context->render_target_view, clearColor);
 	immediateContext->RSSetViewports(1, &viewport);
 	immediateContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	immediateContext->VSSetShader(context->vertex_shader, nullptr, 0);
@@ -1037,7 +1262,11 @@ int render_gpu_decoded_video_frame(void *handle, double cropLeft, double cropTop
 	ID3D11ShaderResourceView *nullViews[2] = {};
 	immediateContext->PSSetShaderResources(0, 2, nullViews);
 
-	const HRESULT presentResult = context->swap_chain->Present(0, 0);
+	// The surface is displayed in a child WinForms HWND. Immediate presents can
+	// race scan-out and expose a partially updated frame, which is most visible
+	// as a flashing strip at the bottom edge. One-vblank synchronization keeps
+	// the swap-chain handoff atomic while retaining the single-copy GPU path.
+	const HRESULT presentResult = context->swap_chain->Present(1, 0);
 	return SUCCEEDED(presentResult) ? 0 : -40;
 }
 

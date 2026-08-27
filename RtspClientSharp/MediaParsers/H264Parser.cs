@@ -28,6 +28,7 @@ namespace RtspClientSharp.MediaParsers
         private byte[] _spsPpsBytes = new byte[0];
         private bool _updateSpsPpsBytes;
         private int _sliceType = -1;
+        private int _fragmentedNalStartPosition = -1;
 
         private readonly MemoryStream _frameStream;
 
@@ -36,7 +37,11 @@ namespace RtspClientSharp.MediaParsers
         public H264Parser(Func<DateTime> frameTimestampProvider)
         {
             _frameTimestampProvider = frameTimestampProvider ?? throw new ArgumentNullException(nameof(frameTimestampProvider));
-            _frameStream = new MemoryStream(8 * 1024);
+            // The captured stream has complete frames around 40 KB and bursts
+            // up to roughly 90 KB. Starting at 128 KB avoids repeated
+            // MemoryStream growth/copy operations while keeping one modest
+            // reusable buffer per parser.
+            _frameStream = new MemoryStream(128 * 1024);
         }
 
         public void Parse(ArraySegment<byte> byteSegment, bool generateFrame)
@@ -54,9 +59,17 @@ namespace RtspClientSharp.MediaParsers
 
         public void TryGenerateFrame()
         {
+            // A fragmented NAL is appended directly to the frame buffer. Do not
+            // expose the preceding NALs while that fragment is incomplete; the
+            // old implementation kept the fragment in a separate stream and
+            // could generate only the completed prefix.
+            if (_fragmentedNalStartPosition >= 0)
+                return;
+
             if (_frameStream.Position == 0)
                 return;
 
+            RawVideoFramePadding.Ensure(_frameStream);
             var frameBytes = new ArraySegment<byte>(_frameStream.GetBuffer(), 0, (int)_frameStream.Position);
             _frameStream.Position = 0;
             TryGenerateFrame(frameBytes);
@@ -85,7 +98,11 @@ namespace RtspClientSharp.MediaParsers
             if (frameType == FrameType.PredictionFrame && !_waitForIFrame)
             {
                 frameTimestamp = _frameTimestampProvider();
-                FrameGenerated?.Invoke(new RawH264PFrame(frameTimestamp, frameBytes));
+                var frame = new RawH264PFrame(frameTimestamp, frameBytes)
+                {
+                    HasDecoderInputPadding = RawVideoFramePadding.IsZeroed(frameBytes)
+                };
+                FrameGenerated?.Invoke(frame);
                 return;
             }
 
@@ -96,15 +113,75 @@ namespace RtspClientSharp.MediaParsers
             var byteSegment = new ArraySegment<byte>(_spsPpsBytes);
 
             frameTimestamp = _frameTimestampProvider();
-            FrameGenerated?.Invoke(new RawH264IFrame(frameTimestamp, frameBytes, byteSegment));
+            var intraFrame = new RawH264IFrame(frameTimestamp, frameBytes, byteSegment)
+            {
+                HasDecoderInputPadding = RawVideoFramePadding.IsZeroed(frameBytes)
+            };
+            FrameGenerated?.Invoke(intraFrame);
         }
 
         public void ResetState()
         {
+            AbortFragmentedNal();
             _frameStream.Position = 0;
             _frameStream.SetLength(0);
             _sliceType = -1;
             _waitForIFrame = true;
+        }
+
+        internal bool HasFragmentedNal => _fragmentedNalStartPosition >= 0;
+
+        internal void BeginFragmentedNal(byte nalHeader, ArraySegment<byte> firstPayload)
+        {
+            AbortFragmentedNal();
+            _fragmentedNalStartPosition = checked((int)_frameStream.Position);
+            _frameStream.Write(StartMarkerSegment.Array, StartMarkerSegment.Offset,
+                StartMarkerSegment.Count);
+            _frameStream.WriteByte(nalHeader);
+            AppendToFrameStream(firstPayload);
+        }
+
+        internal void AppendFragmentedNal(ArraySegment<byte> payload)
+        {
+            if (_fragmentedNalStartPosition < 0)
+                return;
+
+            AppendToFrameStream(payload);
+        }
+
+        internal void CompleteFragmentedNal(bool generateFrame)
+        {
+            int fragmentStartPosition = _fragmentedNalStartPosition;
+            if (fragmentStartPosition < 0)
+                return;
+
+            _fragmentedNalStartPosition = -1;
+            var nalUnitSegment = new ArraySegment<byte>(_frameStream.GetBuffer(), fragmentStartPosition,
+                checked((int)_frameStream.Position - fragmentStartPosition));
+
+            try
+            {
+                bool ignoredGenerateFrame = false;
+                ProcessNalUnit(nalUnitSegment, true, ref ignoredGenerateFrame, false);
+                if (generateFrame)
+                    TryGenerateFrame();
+            }
+            catch
+            {
+                _frameStream.Position = fragmentStartPosition;
+                _frameStream.SetLength(fragmentStartPosition);
+                throw;
+            }
+        }
+
+        internal void AbortFragmentedNal()
+        {
+            if (_fragmentedNalStartPosition < 0)
+                return;
+
+            _frameStream.Position = _fragmentedNalStartPosition;
+            _frameStream.SetLength(_fragmentedNalStartPosition);
+            _fragmentedNalStartPosition = -1;
         }
 
         private void SlicerOnNalUnitFound(ArraySegment<byte> byteSegment)
@@ -113,7 +190,8 @@ namespace RtspClientSharp.MediaParsers
             ProcessNalUnit(byteSegment, true, ref generateFrame);
         }
 
-        private void ProcessNalUnit(ArraySegment<byte> byteSegment, bool hasStartMarker, ref bool generateFrame)
+        private void ProcessNalUnit(ArraySegment<byte> byteSegment, bool hasStartMarker, ref bool generateFrame,
+            bool appendToFrameStream = true)
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
@@ -170,13 +248,21 @@ namespace RtspClientSharp.MediaParsers
                 generateFrame = false;
                 TryGenerateFrame(byteSegment);
             }
-            else
+            else if (appendToFrameStream)
             {
                 if (!hasStartMarker)
                     _frameStream.Write(StartMarkerSegment.Array, StartMarkerSegment.Offset, StartMarkerSegment.Count);
 
-                _frameStream.Write(byteSegment.Array, byteSegment.Offset, byteSegment.Count);
+                AppendToFrameStream(byteSegment);
             }
+        }
+
+        private void AppendToFrameStream(ArraySegment<byte> byteSegment)
+        {
+            if (byteSegment.Array == null || byteSegment.Count == 0)
+                return;
+
+            _frameStream.Write(byteSegment.Array, byteSegment.Offset, byteSegment.Count);
         }
 
         private void ParseSps(ArraySegment<byte> byteSegment, int startMarkerLength)

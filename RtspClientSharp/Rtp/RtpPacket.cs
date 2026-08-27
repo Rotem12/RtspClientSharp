@@ -52,6 +52,22 @@ namespace RtspClientSharp.Rtp
             if (rtpPacket.ProtocolVersion != RtpProtocolVersion)
                 return false;
 
+            // The direct camera path overwhelmingly uses the ordinary 12-byte
+            // RTP header (no CSRCs, extension, or padding). Keep the generic
+            // parser below for the full RFC form, but make the hot path avoid
+            // the extra header-offset and feature-flag branches.
+            if ((byteSegment.Array[offset] & 0x3F) == 0)
+            {
+                rtpPacket.MarkerBit = (byteSegment.Array[offset + 1] & 0x80) != 0;
+                rtpPacket.PayloadType = byteSegment.Array[offset + 1] & 0x7F;
+                rtpPacket.SeqNumber = (ushort)BigEndianConverter.ReadUInt16(byteSegment.Array, offset + 2);
+                rtpPacket.Timestamp = BigEndianConverter.ReadUInt32(byteSegment.Array, offset + 4);
+                rtpPacket.SyncSourceId = BigEndianConverter.ReadUInt32(byteSegment.Array, offset + 8);
+                rtpPacket.PayloadSegment = new ArraySegment<byte>(byteSegment.Array, offset + RtpHeaderSize,
+                    byteSegment.Count - RtpHeaderSize);
+                return true;
+            }
+
             rtpPacket.PaddingFlag = (byteSegment.Array[offset] >> 5 & 1) != 0;
             rtpPacket.ExtensionFlag = (byteSegment.Array[offset] >> 4 & 1) != 0;
             rtpPacket.CsrcCount = byteSegment.Array[offset++] & 0xF;

@@ -124,6 +124,28 @@ namespace RtspClientSharp.UnitTests.MediaParsers
             Assert.IsTrue(frame.FrameSegment.SequenceEqual(iFrameBytes));
         }
 
+        [TestMethod]
+        public void Parse_FrameWithZeroedTail_MarksDecoderInputPadding()
+        {
+            var spsBytes = Convert.FromBase64String("AAAAAWdNQCmaZgUB7YC1AQEBBenA");
+            var ppsBytes = Convert.FromBase64String("AAAAAWjuPIA=");
+            var iFrameBytes = new byte[] {0x0, 0x0, 0x0, 0x1, 0x65, 0x88, 0x80, 0x10, 0x00};
+            var paddedInput = new byte[iFrameBytes.Length + 64];
+            Buffer.BlockCopy(iFrameBytes, 0, paddedInput, 0, iFrameBytes.Length);
+
+            RawH264Frame frame = null;
+            var parser = new H264Parser(() => DateTime.UtcNow)
+            {
+                FrameGenerated = rawFrame => frame = (RawH264Frame)rawFrame
+            };
+            parser.Parse(new ArraySegment<byte>(spsBytes), false);
+            parser.Parse(new ArraySegment<byte>(ppsBytes), false);
+            parser.Parse(new ArraySegment<byte>(paddedInput, 0, iFrameBytes.Length), true);
+
+            Assert.IsNotNull(frame);
+            Assert.IsTrue(frame.HasDecoderInputPadding);
+        }
+
         private static byte[] ToThreeByteStartMarker(byte[] bytes)
         {
             var result = new byte[bytes.Length - 1];

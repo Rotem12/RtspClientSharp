@@ -18,6 +18,13 @@ namespace RtspClientSharp
 
         public ConnectionParameters ConnectionParameters { get; }
 
+        /// <summary>
+        /// Delivers frames synchronously from the parser instead of creating an
+        /// owned display copy. Set before <see cref="ConnectAsync"/> and only use
+        /// it when frame subscribers finish consuming the payload before return.
+        /// </summary>
+        public bool UseInlineFrameDelivery { get; set; }
+
         public event EventHandler<RawFrame> RawFrameGenerated;
         public event EventHandler<RawFrame> FrameReceived;
 
@@ -212,8 +219,10 @@ namespace RtspClientSharp
         private RtspClientInternal CreateRtspClientInternal(ConnectionParameters connectionParameters,
             Func<IRtspTransportClient> transportClientProvider)
         {
+            bool useInlineFrameDelivery = UseInlineFrameDelivery;
             return new RtspClientInternal(connectionParameters, transportClientProvider)
             {
+                UseInlineFrameDelivery = useInlineFrameDelivery,
                 RawFrameGenerated = frame =>
                 {
                     RawFrameGenerated?.Invoke(this, frame);

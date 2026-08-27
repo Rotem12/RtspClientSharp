@@ -92,5 +92,25 @@ namespace RtspClientSharp.UnitTests.Rtp
             Assert.AreEqual(0, rtpStream.SequenceCycles);
             mediaPayloadParserMock.Verify(x => x.ResetState(), Times.Never);
         }
+
+        [TestMethod]
+        public void Process_VideoInputWithAvailableTail_ClearsDecoderPadding()
+        {
+            var packetBytes = new byte[12 + 1 + 64];
+            packetBytes[0] = 0x80;
+            packetBytes[1] = 0x60;
+            packetBytes[12] = 0x65;
+            for (int i = 13; i < packetBytes.Length; i++)
+                packetBytes[i] = 0xFF;
+
+            var mediaPayloadParserMock = new Mock<IMediaPayloadParser>();
+            var rtpStream = new RtpStream(mediaPayloadParserMock.Object, 90000,
+                ensureVideoInputPadding: true);
+
+            rtpStream.Process(new ArraySegment<byte>(packetBytes, 0, 13));
+
+            for (int i = 13; i < packetBytes.Length; i++)
+                Assert.AreEqual(0, packetBytes[i]);
+        }
     }
 }

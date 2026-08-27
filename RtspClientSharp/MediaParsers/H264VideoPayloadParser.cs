@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Diagnostics;
-using System.IO;
 using RtspClientSharp.Codecs.Video;
-using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Utils;
 
 namespace RtspClientSharp.MediaParsers
@@ -23,7 +21,6 @@ namespace RtspClientSharp.MediaParsers
         const int DondFieldSize = 1;
 
         private readonly H264Parser _h264Parser;
-        private readonly MemoryStream _nalStream;
         private bool _waitForStartFu = true;
         private TimeSpan _timeOffset = TimeSpan.MinValue;
 
@@ -39,7 +36,6 @@ namespace RtspClientSharp.MediaParsers
             if (codecInfo.SpsPpsBytes.Length != 0)
                 _h264Parser.Parse(new ArraySegment<byte>(codecInfo.SpsPpsBytes), false);
 
-            _nalStream = new MemoryStream(8 * 1024);
         }
 
         public override void Parse(TimeSpan timeOffset, ArraySegment<byte> byteSegment, bool markerBit)
@@ -85,7 +81,6 @@ namespace RtspClientSharp.MediaParsers
 
         public override void ResetState()
         {
-            ResetNalStream();
             _h264Parser.ResetState();
             _waitForStartFu = true;
         }
@@ -119,11 +114,8 @@ namespace RtspClientSharp.MediaParsers
                 byte nalHeader = (byte)((fuHeader & 0x1F) | (byteSegment.Array[fuIndicatorOffset] & 0xE0));
 
                 // A new start always replaces a previous incomplete or single-packet FU.
-                ResetNalStream();
-                _nalStream.Write(H264Parser.StartMarkerSegment.Array, H264Parser.StartMarkerSegment.Offset,
-                    H264Parser.StartMarkerSegment.Count);
-                _nalStream.WriteByte(nalHeader);
-                _nalStream.Write(byteSegment.Array, fragmentOffset, endOffset - fragmentOffset);
+                _h264Parser.BeginFragmentedNal(nalHeader,
+                    new ArraySegment<byte>(byteSegment.Array, fragmentOffset, endOffset - fragmentOffset));
 
                 if (endFlag)
                     ParseCompletedNal(markerBit);
@@ -144,7 +136,8 @@ namespace RtspClientSharp.MediaParsers
                 return;
             }
 
-            _nalStream.Write(byteSegment.Array, payloadOffset, endOffset - payloadOffset);
+            _h264Parser.AppendFragmentedNal(
+                new ArraySegment<byte>(byteSegment.Array, payloadOffset, endOffset - payloadOffset));
 
             if (endFlag)
                 ParseCompletedNal(markerBit);
@@ -152,22 +145,14 @@ namespace RtspClientSharp.MediaParsers
 
         private void ParseCompletedNal(bool markerBit)
         {
-            if (_nalStream.Position == 0)
+            if (!_h264Parser.HasFragmentedNal)
             {
                 ResetState();
                 return;
             }
 
-            var nalUnitSegment = new ArraySegment<byte>(_nalStream.GetBuffer(), 0, (int)_nalStream.Position);
-            ResetNalStream();
-            _h264Parser.Parse(nalUnitSegment, markerBit);
+            _h264Parser.CompleteFragmentedNal(markerBit);
             _waitForStartFu = true;
-        }
-
-        private void ResetNalStream()
-        {
-            _nalStream.Position = 0;
-            _nalStream.SetLength(0);
         }
 
         private void ParseSTAP(ArraySegment<byte> byteSegment, int donFieldSize,
