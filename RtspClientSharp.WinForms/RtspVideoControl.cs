@@ -864,6 +864,22 @@ namespace RtspClientSharp.WinForms
             // The end-to-end GPU path owns the client pixels through its DXGI
             // swap chain. Clearing the control from WinForms after Present()
             // races the swap chain and produces intermittent black frames.
+            bool gpuPipelineActive = IsPlaying &&
+                DrawImage &&
+                _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd;
+
+            // Do not let an expose/resize paint turn a transiently unready GPU
+            // surface into a no-video frame. The no-video surface is a timeout
+            // state, not a fallback for the interval before the first Present()
+            // or while DXGI is resizing. OnPaint must stay out of the GPU HWND
+            // until CheckForVideoTimeout() explicitly enters that state.
+            if (gpuPipelineActive && !IsNoVideoActive)
+            {
+                if (ShowFPS)
+                    DrawFpsOverlay(e.Graphics);
+                return;
+            }
+
             bool gpuSurfaceOwnsClientArea = IsPlaying &&
                 DrawImage &&
                 !IsNoVideoActive &&
@@ -916,15 +932,19 @@ namespace RtspClientSharp.WinForms
                 }
             }
 
-            if (!gpuSurfaceOwnsClientArea && DrawImage && !videoFramePainted)
+            if (!gpuSurfaceOwnsClientArea && DrawImage && !videoFramePainted &&
+                (!IsPlaying || IsNoVideoActive))
                 DrawNoVideoImage(e.Graphics, ClientRectangle);
 
             if (ShowFPS)
-            {
-                e.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.SingleBitPerPixelGridFit;
-                using (var brush = new SolidBrush(Color.LimeGreen))
-                    e.Graphics.DrawString(_displayFps.ToString(), Font, brush, 8, 8);
-            }
+                DrawFpsOverlay(e.Graphics);
+        }
+
+        private void DrawFpsOverlay(Graphics graphics)
+        {
+            graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.SingleBitPerPixelGridFit;
+            using (var brush = new SolidBrush(Color.LimeGreen))
+                graphics.DrawString(_displayFps.ToString(), Font, brush, 8, 8);
         }
 
         private Rectangle GetVideoDestinationRectangle(Size imageSize, Size clientSize)
@@ -1140,10 +1160,10 @@ namespace RtspClientSharp.WinForms
                         {
                             decoder.RenderGpuFrame(ClampCrop(DrawLeft), ClampCrop(DrawUp),
                                 ClampCrop(DrawRight), ClampCrop(DrawDown));
-                            // The native renderer owns the client pixels only
-                            // after it has created the swap chain and completed
-                            // the first Present(). Until then WinForms must be
-                            // allowed to paint the configured no-video surface.
+                            // The native renderer owns the client pixels after
+                            // Present(). WinForms intentionally stays out of
+                            // the active GPU surface; the no-video image is
+                            // entered only by the inactivity timeout state.
                             Volatile.Write(ref _gpuSurfaceReady, 1);
                             Interlocked.Increment(ref _gpuRenderedFrameCount);
                             if (ShowFPS)
