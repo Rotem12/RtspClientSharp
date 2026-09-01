@@ -1,16 +1,18 @@
 using System;
 using System.Collections.Generic;
+using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.MediaParsers;
 using RtspClientSharp.RawFrames;
 using RtspClientSharp.RawFrames.Audio;
 
 namespace RtspClientSharp.Ts
 {
-    class TsStream : ITransportStream
+    class TsStream : ITransportStream, IVideoCodecDetector
     {
         private const double TimestampFrequency = 90000.0;
 
         private readonly IMediaPayloadParser _frameSink;
+        private readonly Action<RawFrame> _frameGenerated;
         private readonly Dictionary<ushort, ElementaryStream> _streams = new Dictionary<ushort, ElementaryStream>();
         private readonly Dictionary<ushort, Pes> _currentPesByPid = new Dictionary<ushort, Pes>();
         private readonly TsPacketFactory _tsPacketFactory;
@@ -18,13 +20,22 @@ namespace RtspClientSharp.Ts
         private DateTime _baseTime;
         private TimeSpan _currentTimeOffset;
         private ushort _pmtPid;
+        private CodecInfoType _detectedVideoCodec = CodecInfoType.Auto;
 
         public int PacketsReceivedSinceLastReset { get; private set; }
         public int PacketsLostSinceLastReset { get; private set; }
+        public CodecInfoType DetectedVideoCodec => _detectedVideoCodec;
 
         public TsStream(IMediaPayloadParser mediaPayloadParser)
         {
             _frameSink = mediaPayloadParser ?? throw new ArgumentNullException(nameof(mediaPayloadParser));
+            _tsPacketFactory = new TsPacketFactory();
+            _tsPacketFactory.SynchronousPacketReady = ProcessTsPacket;
+        }
+
+        internal TsStream(Action<RawFrame> frameGenerated)
+        {
+            _frameGenerated = frameGenerated ?? throw new ArgumentNullException(nameof(frameGenerated));
             _tsPacketFactory = new TsPacketFactory();
             _tsPacketFactory.SynchronousPacketReady = ProcessTsPacket;
         }
@@ -170,9 +181,17 @@ namespace RtspClientSharp.Ts
                 case 0x0F:
                     return new ElementaryStream(streamType, ElementaryStreamKind.Aac, RaiseFrame, GetTimestamp);
                 case 0x1B:
+                    _detectedVideoCodec = CodecInfoType.H264;
                     return new ElementaryStream(streamType, ElementaryStreamKind.H264, RaiseFrame, GetTimestamp);
                 case 0x24:
+                    _detectedVideoCodec = CodecInfoType.H265;
                     return new ElementaryStream(streamType, ElementaryStreamKind.H265, RaiseFrame, GetTimestamp);
+                // Motion JPEG is commonly carried as private PES data in an MPEG-TS
+                // program. The elementary parser identifies the JPEG SOI/EOI markers,
+                // so unrelated private data simply produces no video frame.
+                case 0x06:
+                    _detectedVideoCodec = CodecInfoType.MJPEG;
+                    return new ElementaryStream(streamType, ElementaryStreamKind.Mjpeg, RaiseFrame, GetTimestamp);
                 default:
                     return null;
             }
@@ -212,13 +231,17 @@ namespace RtspClientSharp.Ts
 
         private void RaiseFrame(RawFrame frame)
         {
-            _frameSink.FrameGenerated?.Invoke(frame);
+            if (_frameSink != null)
+                _frameSink.FrameGenerated?.Invoke(frame);
+            else
+                _frameGenerated?.Invoke(frame);
         }
 
         private enum ElementaryStreamKind
         {
             H264,
             H265,
+            Mjpeg,
             Aac
         }
 
@@ -228,6 +251,7 @@ namespace RtspClientSharp.Ts
             private readonly Func<DateTime> _timestampProvider;
             private readonly H264Parser _h264Parser;
             private readonly H265Parser _h265Parser;
+            private readonly RawJpegParser _jpegParser;
             private byte[] _aacConfig = new byte[0];
 
             public byte StreamType { get; }
@@ -245,6 +269,8 @@ namespace RtspClientSharp.Ts
                     _h264Parser = new H264Parser(timestampProvider) { FrameGenerated = frameGenerated };
                 else if (kind == ElementaryStreamKind.H265)
                     _h265Parser = new H265Parser(timestampProvider) { FrameGenerated = frameGenerated };
+                else if (kind == ElementaryStreamKind.Mjpeg)
+                    _jpegParser = new RawJpegParser(timestampProvider) { FrameGenerated = frameGenerated };
             }
 
             public void Parse(ArraySegment<byte> payload)
@@ -257,6 +283,9 @@ namespace RtspClientSharp.Ts
                     case ElementaryStreamKind.H265:
                         _h265Parser.Parse(payload, true);
                         break;
+                    case ElementaryStreamKind.Mjpeg:
+                        _jpegParser.Parse(payload);
+                        break;
                     case ElementaryStreamKind.Aac:
                         ParseAdts(payload);
                         break;
@@ -267,6 +296,7 @@ namespace RtspClientSharp.Ts
             {
                 _h264Parser?.ResetState();
                 _h265Parser?.ResetState();
+                _jpegParser?.ResetState();
             }
 
             private void ParseAdts(ArraySegment<byte> payload)

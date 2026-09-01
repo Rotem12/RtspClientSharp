@@ -1,7 +1,4 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-
 namespace RtspClientSharp.Rtp
 {
     public enum RtpH265NALUType
@@ -97,9 +94,21 @@ namespace RtspClientSharp.Rtp
 
         public static bool CheckIfIsValid(int nalUType)
         {
-            List<RtpH265NALUType> rtpNalUnitTypes = Enum.GetValues(typeof(RtpH265NALUType)).Cast<RtpH265NALUType>().ToList();
+            // The HEVC NALU type namespace is contiguous from 0 through 49,
+            // including the RTP aggregation/fragmentation types. Avoid building
+            // an enum list for every RTP packet on the receive path.
+            return nalUType >= (int)RtpH265NALUType.TRAIL_N &&
+                   nalUType <= (int)RtpH265NALUType.RTPHEVC_FP;
+        }
 
-            return rtpNalUnitTypes.Where(n => (int)n == nalUType).Count() > 0;
+        public static bool IsVideoCodingLayerNalUnit(int nalUnitType)
+        {
+            return nalUnitType >= 0 && nalUnitType <= 31;
+        }
+
+        public static bool IsIntraFrameNalUnit(int nalUnitType)
+        {
+            return nalUnitType >= 16 && nalUnitType <= 23;
         }
     }
 }

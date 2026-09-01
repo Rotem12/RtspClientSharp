@@ -139,10 +139,14 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
-            if (byteSegment.Count < JpegHeaderSize)
-                throw new MediaPayloadParserException("Input data size is smaller than JPEG header size");
+            if (byteSegment.Array == null || byteSegment.Count < JpegHeaderSize)
+            {
+                ResetState();
+                return;
+            }
 
             int offset = byteSegment.Offset + 1;
+            int endOffset = byteSegment.Offset + byteSegment.Count;
 
             int fragmentOffset = BigEndianConverter.ReadUInt24(byteSegment.Array, offset);
             offset += 3;
@@ -155,6 +159,12 @@ namespace RtspClientSharp.MediaParsers
 
             if (type > 63)
             {
+                if (endOffset - offset < 4)
+                {
+                    ResetState();
+                    return;
+                }
+
                 dri = BigEndianConverter.ReadUInt16(byteSegment.Array, offset);
                 offset += 4;
             }
@@ -168,6 +178,12 @@ namespace RtspClientSharp.MediaParsers
 
                 if (q > 127)
                 {
+                    if (endOffset - offset < 4)
+                    {
+                        ResetState();
+                        return;
+                    }
+
                     int mbz = byteSegment.Array[offset];
 
                     if (mbz == 0)
@@ -175,6 +191,12 @@ namespace RtspClientSharp.MediaParsers
                         _hasExternalQuantizationTable = true;
 
                         int quantizationTablesLength = BigEndianConverter.ReadUInt16(byteSegment.Array, offset + 2);
+                        if (quantizationTablesLength > endOffset - offset - 4)
+                        {
+                            ResetState();
+                            return;
+                        }
+
                         offset += 4;
 
                         if (!ArrayUtils.IsBytesEquals(byteSegment.Array, offset, quantizationTablesLength,

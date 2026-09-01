@@ -10,7 +10,10 @@ recording path for:
 
 For direct UDP, leave `TransportMode` as `Auto` to classify the first datagram
 as RTP or MPEG-TS. Set it explicitly only when a sender needs a deterministic
-format. `SourceType=Auto` selects RTSP for RTSP URLs and direct UDP otherwise.
+format. Leave `VideoCodec` as `CodecInfoType.Auto` to identify direct RTP
+H.264, H.265, and RFC 2435 MJPEG, or to read H.264/H.265/private-PES MJPEG
+from an MPEG-TS program map. `SourceType=Auto` selects RTSP for RTSP URLs and
+direct UDP otherwise.
 
 ```csharp
 var video = new RtspVideoControl
@@ -18,6 +21,7 @@ var video = new RtspVideoControl
     Dock = DockStyle.Fill,
     SourceType = VideoSourceType.Auto,
     TransportMode = MediaTransportMode.Auto,
+    VideoCodec = RtspClientSharp.Codecs.Video.CodecInfoType.Auto,
     NoVideoImage = Properties.Resources.novideo,
     PipelineMode = VideoPipelineMode.HardwareDecodeWithCpuReadback,
     ConnectionParameters = new ConnectionParameters(
@@ -77,10 +81,12 @@ must match the process architecture (`x86` or `x64`). The WinForms project
 copies it from `Examples/libffmpeghelper` when that helper has been built.
 
 Direct RTP has no SDP exchange. If an H.264 sender never sends SPS/PPS in-band,
-provide Annex-B SPS/PPS through `H264SpsPpsBytes` before `Start`; there is no
-metadata in the RTP payload from which a missing parameter set can be
-reconstructed. When the stream repeats SPS/PPS at an IDR, leave the property
-empty.
+provide Annex-B SPS/PPS through `H264SpsPpsBytes` before `Start`; for the same
+case with H.265, use `H265VpsSpsPpsBytes`. There is no metadata in the RTP
+payload from which missing parameter sets can be reconstructed. When the stream
+repeats its parameter sets at an IDR, leave the corresponding property empty.
+`DetectedVideoCodec` reports the selected codec after the first direct RTP
+probe or MPEG-TS PMT.
 
 `FrameDecoded` is raised from the receive/decoder worker, not the WinForms UI
 thread. Marshal to the UI thread when updating controls. The diagnostic
@@ -92,3 +98,11 @@ counters (`TransportDatagramCount`, `TransportFrameCount`,
 socket/parser delivery, dispatcher loss, decoder failure, GPU presentation,
 and intentional display throttling. GPU rendering honors `RenderIntervalMs`;
 decoded frames skipped by that pacing are counted by `GpuSkippedFrameCount`.
+
+For an intermittent display or GPU presentation issue, enable the opt-in trace
+before starting the application. Set `RTSPCLIENTSHARP_TRACE` to a writable log
+file path, or set it to `1` to use `%TEMP%\RtspClientSharp\rtsp-video-trace.log`.
+The trace records the loaded WinForms assembly, pipeline transitions, control and
+GPU-surface sizes/visibility, resize and paint-state transitions, decoded/GPU
+counters, and native decode/render result codes. It is disabled by default and
+diagnostic failures are ignored so tracing cannot affect playback.

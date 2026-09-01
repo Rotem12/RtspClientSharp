@@ -13,13 +13,15 @@ namespace RtspClientSharp.MediaParsers
         public static void Slice(ArraySegment<byte> byteSegment, Action<ArraySegment<byte>> nalUnitHandler)
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
-            Debug.Assert(ArrayUtils.StartsWith(byteSegment.Array, byteSegment.Offset, byteSegment.Count, 
-                RawH265Frame.StartMarker));
+
+            if (!StartsWithStartMarker(byteSegment))
+                return;
 
             int endIndex = byteSegment.Offset + byteSegment.Count;
 
-            int nalUnitStartIndex = ArrayUtils.IndexOfBytes(byteSegment.Array, RawH265Frame.StartMarker, 
-                byteSegment.Offset, byteSegment.Count);
+            int markerLength;
+            int nalUnitStartIndex = FindStartMarker(byteSegment.Array, byteSegment.Offset, endIndex,
+                out markerLength);
 
             if (nalUnitStartIndex == -1)
                 nalUnitHandler?.Invoke(byteSegment);
@@ -28,28 +30,29 @@ namespace RtspClientSharp.MediaParsers
             {
                 int tailLength = endIndex - nalUnitStartIndex;
 
-                if (tailLength == RawH265Frame.StartMarkerSize)
+                if (tailLength <= markerLength)
                     return;
                 
-                int nalUnitType = (byteSegment.Array[nalUnitStartIndex + RawH265Frame.StartMarkerSize] >> 1) & 0x3F;
+                int nalUnitType = (byteSegment.Array[nalUnitStartIndex + markerLength] >> 1) & 0x3F;
 
                 if (!RtpH265TypeUtils.CheckIfIsValid(nalUnitType))
                     throw new H265ParserException($"Invalid (HEVC) NAL Unit Type { nalUnitType }");
 
-                if ((RtpH265NALUType)nalUnitType == RtpH265NALUType.IDR_W_RADL || (RtpH265NALUType)nalUnitType == RtpH265NALUType.TRAIL_R)
+                if (RtpH265TypeUtils.IsVideoCodingLayerNalUnit(nalUnitType))
                 {
                     nalUnitHandler?.Invoke(new ArraySegment<byte>(byteSegment.Array, nalUnitStartIndex, tailLength));
                     return;
                 }
 
-                int nextNalUnitStartIndex = ArrayUtils.IndexOfBytes(byteSegment.Array, RawH265Frame.StartMarker, 
-                    nalUnitStartIndex + RawH265Frame.StartMarkerSize, tailLength - RawH265Frame.StartMarkerSize);
+                int nextMarkerLength;
+                int nextNalUnitStartIndex = FindStartMarker(byteSegment.Array,
+                    nalUnitStartIndex + markerLength, endIndex, out nextMarkerLength);
 
-                if(nextNalUnitStartIndex > 0)
+                if(nextNalUnitStartIndex >= 0)
                 {
                     int nalUnitLength = nextNalUnitStartIndex - nalUnitStartIndex;
 
-                    if (nalUnitLength != RawH265Frame.StartMarkerSize)
+                    if (nalUnitLength > markerLength)
                         nalUnitHandler?.Invoke(new ArraySegment<byte>(byteSegment.Array, nalUnitStartIndex, nalUnitLength));
                 }
                 else
@@ -59,7 +62,47 @@ namespace RtspClientSharp.MediaParsers
                 }
 
                 nalUnitStartIndex = nextNalUnitStartIndex;
+                markerLength = nextMarkerLength;
             }
+        }
+
+        public static bool StartsWithStartMarker(ArraySegment<byte> byteSegment)
+        {
+            if (byteSegment.Array == null || byteSegment.Count < 3)
+                return false;
+
+            return GetStartMarkerLength(byteSegment.Array, byteSegment.Offset,
+                byteSegment.Offset + byteSegment.Count) != 0;
+        }
+
+        public static int GetStartMarkerLength(byte[] data, int index, int endIndex)
+        {
+            if (data == null || index < 0 || index >= endIndex)
+                return 0;
+
+            if (index + 4 <= endIndex && data[index] == 0 && data[index + 1] == 0 &&
+                data[index + 2] == 0 && data[index + 3] == 1)
+                return RawH265Frame.StartMarkerSize;
+
+            if (index + 3 <= endIndex && data[index] == 0 && data[index + 1] == 0 &&
+                data[index + 2] == 1)
+                return 3;
+
+            return 0;
+        }
+
+        private static int FindStartMarker(byte[] data, int startIndex, int endIndex,
+            out int markerLength)
+        {
+            for (int index = startIndex; index + 2 < endIndex; index++)
+            {
+                markerLength = GetStartMarkerLength(data, index, endIndex);
+                if (markerLength != 0)
+                    return index;
+            }
+
+            markerLength = 0;
+            return -1;
         }
     }
 }

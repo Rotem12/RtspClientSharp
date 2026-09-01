@@ -1,11 +1,12 @@
 ﻿using System;
+using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.MediaParsers;
 
 using RtspClientSharp.RawFrames.Video;
 
 namespace RtspClientSharp.Rtp
 {
-    class RtpStream : ITransportStream, IRtpStatisticsProvider
+    class RtpStream : ITransportStream, IRtpStatisticsProvider, IVideoCodecDetector
     {
         private readonly IRtpSequenceAssembler _rtpSequenceAssembler;
         private readonly IMediaPayloadParser _mediaPayloadParser;
@@ -24,6 +25,8 @@ namespace RtspClientSharp.Rtp
         public int PacketsLostSinceLastReset { get; private set; }
         public uint CumulativePacketLost { get; private set; }
         public ushort SequenceCycles { get; private set; }
+        public CodecInfoType DetectedVideoCodec =>
+            (_mediaPayloadParser as IVideoCodecDetector)?.DetectedVideoCodec ?? CodecInfoType.Auto;
 
         public RtpStream(IMediaPayloadParser mediaPayloadParser, int samplesFrequency,
             IRtpSequenceAssembler rtpSequenceAssembler = null, bool ensureVideoInputPadding = false)

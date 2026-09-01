@@ -276,6 +276,7 @@ namespace RtspClientSharp.WinForms
         }
 
         public int LastGpuDecodeResult { get; private set; }
+        public int LastGpuRenderResult { get; private set; }
         public bool IsHardwareAccelerated => _isHardwareAccelerated;
 
         public static FfmpegVideoDecoder Create(FfmpegVideoCodecId codecId, bool preferHardwareAcceleration)
@@ -378,6 +379,7 @@ namespace RtspClientSharp.WinForms
         {
             int resultCode = FfmpegVideoPInvoke.RenderGpuDecodedFrame(_decoderHandle, cropLeft, cropTop,
                 cropRight, cropBottom);
+            LastGpuRenderResult = resultCode;
             if (resultCode != 0)
                 throw new DecoderException($"An error occurred while rendering GPU video frame for {_codecId}, code: {resultCode}");
         }

@@ -9,7 +9,7 @@
     <Description>C# RTSP Client for .NET
 
 - Supported transport protocols: TCP/HTTP/UDP
-- Supported media codecs: H.264/MJPEG/AAC/G711A/G711U/PCM/G726
+- Supported media codecs: H.264/H.265/MJPEG/AAC/G711A/G711U/PCM/G726
 - No external dependencies, pure C# code
 - Asynchronous nature with cancellation tokens support
 - Designed to be fast and scaleable

@@ -6,7 +6,7 @@
 This repo contains C# RTSP client implementation (called "RtspClientSharp") for .NET Standard 2.0
 ## Features
 - Supported transport protocols: TCP/HTTP/UDP
-- Supported media codecs: H.264/MJPEG/AAC/G711A/G711U/PCM/G726
+- Supported media codecs: H.264/H.265/MJPEG/AAC/G711A/G711U/PCM/G726
 - No external dependencies, pure C# code
 - Asynchronous nature with cancellation tokens support
 - Designed to be fast and scaleable
@@ -50,6 +50,8 @@ using(var rtspClient = new RtspClient(connectionParameters))
         {
             case RawH264IFrame h264IFrame:
             case RawH264PFrame h264PFrame:
+            case RawH265IFrame h265IFrame:
+            case RawH265PFrame h265PFrame:
             case RawJpegFrame jpegFrame:
             case RawAACFrame aacFrame:
             case RawG711AFrame g711AFrame:
@@ -71,8 +73,10 @@ https://github.com/BogdanovKirill/RtspClientSharp/tree/master/Examples
 
 The Windows-specific `RtspClientSharp.WinForms` project provides a reusable
 `RtspVideoControl` for RTSP, direct RTP-over-UDP, and raw MPEG-TS-over-UDP.
-Use `SourceType=Auto` and `TransportMode=MediaTransportMode.Auto` to select the
-input and sniff RTP versus MPEG-TS automatically. The control uses a bounded
+Use `SourceType=Auto`, `TransportMode=MediaTransportMode.Auto`, and leave
+`VideoCodec=CodecInfoType.Auto` to select the input, sniff RTP versus MPEG-TS,
+and identify direct RTP H.264/H.265/MJPEG automatically. Raw MPEG-TS selects
+H.264, H.265, or private-PES Motion JPEG from the program map. The control uses a bounded
 latest-frame display buffer, supports software/D3D11 pipelines, and records
 H.264/H.265 directly into video-only MPEG-TS without decoding or AForge. Use an
 explicit `.h264` or `.h265` output path when a raw Annex-B elementary stream is

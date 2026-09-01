@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Threading;
+using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.RawFrames;
 using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Recording;
@@ -83,6 +84,7 @@ namespace RtspClientSharp.WinForms
         private long _lastTransportDatagramCount;
         private long _lastTransportFrameCount;
         private long _lastTransportDroppedFrameCount;
+        private int _detectedVideoCodec = (int)CodecInfoType.Auto;
         private CompressedVideoRollingBuffer _compressedPreRecord;
         private ICompressedVideoRecorder _compressedRecorder;
         private BitmapVideoRollingBuffer _bitmapPreRecord;
@@ -107,6 +109,9 @@ namespace RtspClientSharp.WinForms
         private VideoTransformParameters _recordingTransform;
         private TimeSpan _noVideoTimeout = TimeSpan.FromSeconds(3);
         private int _preRecordSeconds;
+        private string _diagnosticLastState;
+        private long _diagnosticLastStateTimestamp;
+        private int _diagnosticFirstGpuFrameLogged;
 
         public RtspVideoControl()
         {
@@ -125,6 +130,7 @@ namespace RtspClientSharp.WinForms
             _renderTimer = new System.Windows.Forms.Timer { Interval = DefaultRenderIntervalMs };
             _renderTimer.Tick += RenderTimerOnTick;
             UpdateRenderSize(ClientSize);
+            RtspVideoTrace.Write($"control-created assembly={typeof(RtspVideoControl).Assembly.Location} bitness={IntPtr.Size * 8}");
         }
 
         public ConnectionParameters ConnectionParameters
@@ -146,13 +152,33 @@ namespace RtspClientSharp.WinForms
         /// </summary>
         public MediaTransportMode TransportMode { get; set; } = MediaTransportMode.Auto;
 
-        public bool IsH264 { get; set; } = true;
+        /// <summary>
+        /// Selects the direct-UDP video codec. Auto detects H.264, H.265, or
+        /// MJPEG from RTP and reads the codec from the MPEG-TS PMT.
+        /// </summary>
+        public CodecInfoType VideoCodec { get; set; } = CodecInfoType.Auto;
+
+        /// <summary>
+        /// Backward-compatible H.264/MJPEG selector. New code should use
+        /// <see cref="VideoCodec"/> and leave it at Auto when the source is unknown.
+        /// </summary>
+        [Obsolete("Use VideoCodec. The default now auto-detects the codec.")]
+        public bool IsH264
+        {
+            get => VideoCodec != CodecInfoType.MJPEG;
+            set => VideoCodec = value ? CodecInfoType.H264 : CodecInfoType.MJPEG;
+        }
 
         /// <summary>
         /// Optional Annex-B SPS/PPS for a direct RTP H.264 sender that never transmits
         /// parameter sets in-band. When the sender includes SPS/PPS, leave this empty.
         /// </summary>
         public byte[] H264SpsPpsBytes { get; set; } = Array.Empty<byte>();
+
+        /// <summary>
+        /// Optional Annex-B VPS/SPS/PPS bytes for direct RTP H.265.
+        /// </summary>
+        public byte[] H265VpsSpsPpsBytes { get; set; } = Array.Empty<byte>();
 
         public VideoPipelineMode PipelineMode
         {
@@ -167,6 +193,8 @@ namespace RtspClientSharp.WinForms
                 UpdateWinFormsPaintMode(value);
                 RequestGpuSurfaceVisibilityUpdate();
                 DropVideoDecoders();
+                RtspVideoTrace.Write($"pipeline-mode requested={value}");
+                TraceGpuState("pipeline-mode", true);
             }
         }
 
@@ -278,6 +306,7 @@ namespace RtspClientSharp.WinForms
             get => _drawImage;
             set
             {
+                bool previousValue = _drawImage;
                 _drawImage = value;
                 if (!value)
                     ClearPresentedFrame();
@@ -285,6 +314,11 @@ namespace RtspClientSharp.WinForms
                     Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
                 RequestGpuSurfaceVisibilityUpdate();
                 Invalidate(false);
+                if (previousValue != value)
+                {
+                    RtspVideoTrace.Write($"draw-image changed from={previousValue} to={value}");
+                    TraceGpuState("draw-image", true);
+                }
             }
         }
 
@@ -370,9 +404,14 @@ namespace RtspClientSharp.WinForms
             {
                 int transportModeValue = (int)value;
                 if (Volatile.Read(ref _detectedTransportMode) != transportModeValue)
+                {
                     Volatile.Write(ref _detectedTransportMode, transportModeValue);
+                    RtspVideoTrace.Write($"transport-detected mode={value}");
+                }
             }
         }
+        public CodecInfoType DetectedVideoCodec =>
+            (CodecInfoType)Volatile.Read(ref _detectedVideoCodec);
         public int LastVideoWidth => Volatile.Read(ref _lastVideoWidth);
         public int LastVideoHeight => Volatile.Read(ref _lastVideoHeight);
         /// <summary>Number of complete raw frames delivered by the transport pipeline.</summary>
@@ -439,6 +478,10 @@ namespace RtspClientSharp.WinForms
             Interlocked.Exchange(ref _lastTransportDatagramCount, 0);
             Interlocked.Exchange(ref _lastTransportFrameCount, 0);
             Interlocked.Exchange(ref _lastTransportDroppedFrameCount, 0);
+            Volatile.Write(ref _detectedVideoCodec, (int)CodecInfoType.Auto);
+            Interlocked.Exchange(ref _diagnosticFirstGpuFrameLogged, 0);
+            Interlocked.Exchange(ref _diagnosticLastStateTimestamp, 0);
+            Interlocked.Exchange(ref _diagnosticLastState, null);
             _effectivePipelineMode = _pipelineMode;
             UpdateWinFormsPaintMode(_effectivePipelineMode);
             _gpuDecodeFailureCount = 0;
@@ -486,6 +529,8 @@ namespace RtspClientSharp.WinForms
             _renderTimer.Start();
             Invalidate(false);
             SetStatus("Starting stream...");
+            RtspVideoTrace.Write($"start source={SourceType} transport={TransportMode} pipeline={_effectivePipelineMode} client={ClientSize} handle=0x{Handle.ToInt64():X}");
+            TraceGpuState("start", true);
 
             try
             {
@@ -543,6 +588,8 @@ namespace RtspClientSharp.WinForms
             if (wasPlaying || source != null)
                 SetStatus("Stopped");
             Invalidate(false);
+            RtspVideoTrace.Write($"stop wasPlaying={wasPlaying}");
+            TraceGpuState("stop", true);
         }
 
         public void SetSize()
@@ -555,6 +602,8 @@ namespace RtspClientSharp.WinForms
             if (_effectivePipelineMode != VideoPipelineMode.GpuD3D11EndToEnd)
                 ClearPresentedFrame();
             Invalidate(false);
+            RtspVideoTrace.Write($"set-size client={ClientSize}");
+            TraceGpuState("set-size", true);
         }
 
         public void GetResolution()
@@ -855,6 +904,8 @@ namespace RtspClientSharp.WinForms
         {
             base.OnResize(e);
             UpdateRenderSize(ClientSize);
+            RtspVideoTrace.Write($"resize client={ClientSize} controlBounds={Bounds}");
+            TraceGpuState("resize", true);
             if (IsPlaying)
             {
                 // Keep the GPU decoder and its reference frames alive across a
@@ -872,6 +923,7 @@ namespace RtspClientSharp.WinForms
             base.OnBackColorChanged(e);
             if (_gpuSurface != null)
                 _gpuSurface.BackColor = BackColor;
+            RtspVideoTrace.Write($"back-color changed argb=0x{BackColor.ToArgb():X8}");
         }
 
         protected override void OnPaintBackground(PaintEventArgs e)
@@ -895,6 +947,8 @@ namespace RtspClientSharp.WinForms
             // until CheckForVideoTimeout() explicitly enters that state.
             if (gpuPipelineActive && !IsNoVideoActive)
             {
+                if (!_gpuSurface.Visible || Volatile.Read(ref _gpuSurfaceReady) == 0)
+                    TraceGpuState("paint-active-gpu-surface-not-ready-or-hidden", true);
                 if (ShowFPS)
                     DrawFpsOverlay(e.Graphics);
                 return;
@@ -905,6 +959,10 @@ namespace RtspClientSharp.WinForms
                 !IsNoVideoActive &&
                 _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd &&
                 Volatile.Read(ref _gpuSurfaceReady) != 0;
+
+            if (IsPlaying && _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd &&
+                !gpuSurfaceOwnsClientArea)
+                TraceGpuState("paint-parent-gpu-not-owning-client", true);
 
             if (!gpuSurfaceOwnsClientArea)
                 e.Graphics.Clear(BackColor);
@@ -1052,14 +1110,16 @@ namespace RtspClientSharp.WinForms
                 connectionParameters.TransportMode == MediaTransportMode.Auto)
                 connectionParameters.TransportMode = TransportMode;
 
-            return new RawFrameSource(() => new DirectUdpRawFrameClient(connectionParameters, IsH264,
-                H264SpsPpsBytes));
+            return new RawFrameSource(() => new DirectUdpRawFrameClient(connectionParameters, VideoCodec,
+                H264SpsPpsBytes, H265VpsSpsPpsBytes));
         }
 
         private void RawFrameSourceOnFrameGenerated(object sender, RawFrame rawFrame)
         {
             if (!IsPlaying || !ReferenceEquals(sender, _rawFrameSource) || rawFrame == null)
                 return;
+
+            UpdateDetectedVideoCodec(sender as IRawFrameSource, rawFrame);
 
             if (Volatile.Read(ref _compressedRecordingNeeded) == 0)
                 return;
@@ -1085,6 +1145,8 @@ namespace RtspClientSharp.WinForms
 
             if (DetectedTransportMode == MediaTransportMode.Auto && sender is IRawFrameSource source)
                 DetectedTransportMode = source.DetectedTransportMode;
+
+            UpdateDetectedVideoCodec(sender as IRawFrameSource, rawFrame);
 
             if (rawFrame == null)
                 return;
@@ -1121,6 +1183,23 @@ namespace RtspClientSharp.WinForms
             }
         }
 
+        private void UpdateDetectedVideoCodec(IRawFrameSource source, RawFrame rawFrame)
+        {
+            CodecInfoType codec = source?.DetectedVideoCodec ?? CodecInfoType.Auto;
+            if (codec == CodecInfoType.Auto)
+            {
+                if (rawFrame is RawH264Frame)
+                    codec = CodecInfoType.H264;
+                else if (rawFrame is RawH265Frame)
+                    codec = CodecInfoType.H265;
+                else if (rawFrame is RawJpegFrame)
+                    codec = CodecInfoType.MJPEG;
+            }
+
+            if (codec != CodecInfoType.Auto)
+                Volatile.Write(ref _detectedVideoCodec, (int)codec);
+        }
+
         private bool TryRenderGpuFrame(int generation, RawVideoFrame rawVideoFrame)
         {
             if (!IsPlaying || generation != Volatile.Read(ref _generation))
@@ -1137,6 +1216,7 @@ namespace RtspClientSharp.WinForms
             int fallbackResultCode = 0;
             bool reportDecoderStatus = false;
             VideoFrameEventArgs decodedEvent = null;
+            FfmpegVideoDecoder activeDecoder = null;
 
             try
             {
@@ -1148,7 +1228,10 @@ namespace RtspClientSharp.WinForms
                         decoder.SetRenderTarget(_gpuSurface.Handle);
                         _videoDecoders.Add(codecId, decoder);
                         reportDecoderStatus = true;
+                        RtspVideoTrace.Write($"gpu-decoder-created codec={codecId} hardware={decoder.IsHardwareAccelerated} surfaceHandle=0x{_gpuSurface.Handle.ToInt64():X}");
                     }
+
+                    activeDecoder = decoder;
 
                     if (!decoder.TryDecodeToGpu(rawVideoFrame,
                         out DecodedVideoFrameParameters parameters))
@@ -1157,6 +1240,7 @@ namespace RtspClientSharp.WinForms
                         Interlocked.Increment(ref _droppedFrameCount);
                         int failures = Interlocked.Increment(ref _gpuDecodeFailureCount);
                         int resultCode = decoder.LastGpuDecodeResult;
+                        RtspVideoTrace.Write($"gpu-decode-failure codec={codecId} result={resultCode} consecutive={failures} hardware={decoder.IsHardwareAccelerated}");
                         ReportDecoderStatus(codecId, decoder);
                         if (!decoder.IsHardwareAccelerated || failures >= 3 || resultCode == -5)
                         {
@@ -1186,6 +1270,8 @@ namespace RtspClientSharp.WinForms
                             // entered only by the inactivity timeout state.
                             Volatile.Write(ref _gpuSurfaceReady, 1);
                             Interlocked.Increment(ref _gpuRenderedFrameCount);
+                            if (Interlocked.CompareExchange(ref _diagnosticFirstGpuFrameLogged, 1, 0) == 0)
+                                RtspVideoTrace.Write($"gpu-first-present codec={codecId} size={parameters.Width}x{parameters.Height} renderResult={decoder.LastGpuRenderResult}");
                             if (ShowFPS)
                                 UpdateFps();
                         }
@@ -1203,6 +1289,7 @@ namespace RtspClientSharp.WinForms
             catch (Exception exception)
             {
                 fallbackToCpu = true;
+                RtspVideoTrace.Write($"gpu-path-exception message={exception.Message} decodeResult={(activeDecoder == null ? 0 : activeDecoder.LastGpuDecodeResult)} renderResult={(activeDecoder == null ? 0 : activeDecoder.LastGpuRenderResult)}");
                 SetDecoderStatus($"D3D11 render setup failed; falling back to CPU readback: {exception.Message}");
             }
 
@@ -1217,6 +1304,7 @@ namespace RtspClientSharp.WinForms
                 DropVideoDecoders();
                 if (fallbackResultCode != 0)
                     SetDecoderStatus($"D3D11VA unavailable (decode code {fallbackResultCode}); falling back to software decode");
+                RtspVideoTrace.Write($"gpu-fallback result={fallbackResultCode} effectivePipeline={_effectivePipelineMode}");
                 DecodeAndPublishCpuFrame(generation, rawVideoFrame, false);
                 return true;
             }
@@ -1590,6 +1678,7 @@ namespace RtspClientSharp.WinForms
 
             CheckForVideoTimeout();
             RequestGpuSurfaceVisibilityUpdate();
+            TraceGpuState("render-timer");
 
             // Present() refreshes the GPU-owned surface. Avoid scheduling a
             // competing WinForms paint for every frame; only the optional FPS
@@ -1616,6 +1705,7 @@ namespace RtspClientSharp.WinForms
             if (Interlocked.Exchange(ref _noVideoActive, 1) != 0)
                 return;
 
+            RtspVideoTrace.Write($"no-video-timeout seconds={NoVideoTimeout.TotalSeconds:F3}");
             RequestGpuSurfaceVisibilityUpdate();
             DropVideoDecoders();
             if (DrawImage)
@@ -1633,7 +1723,10 @@ namespace RtspClientSharp.WinForms
             Interlocked.Exchange(ref _lastVideoActivityTimestamp, Stopwatch.GetTimestamp());
             if (Volatile.Read(ref _noVideoActive) != 0 &&
                 Interlocked.Exchange(ref _noVideoActive, 0) != 0)
+            {
+                RtspVideoTrace.Write("video-activity-resumed");
                 SetStatus("Video frames resumed");
+            }
         }
 
         private void TryRecordNoVideoFrame()
@@ -1689,6 +1782,7 @@ namespace RtspClientSharp.WinForms
         private void SetStatus(string status)
         {
             LastStatus = status;
+            RtspVideoTrace.Write($"status value={SanitizeDiagnosticText(status)}");
             StatusChanged?.Invoke(this, status);
         }
 
@@ -1699,6 +1793,7 @@ namespace RtspClientSharp.WinForms
                 return;
 
             _reportedDecoderStatus = status;
+            RtspVideoTrace.Write($"decoder-status value={SanitizeDiagnosticText(status)}");
             StatusChanged?.Invoke(this, status);
         }
 
@@ -1754,11 +1849,52 @@ namespace RtspClientSharp.WinForms
             bool visible = IsPlaying && DrawImage &&
                            _effectivePipelineMode == VideoPipelineMode.GpuD3D11EndToEnd &&
                            !IsNoVideoActive;
+            bool previousVisible = _gpuSurface.Visible;
             if (_gpuSurface.Visible != visible)
                 _gpuSurface.Visible = visible;
 
             if (visible)
                 _gpuSurface.BringToFront();
+
+            if (previousVisible != visible)
+                RtspVideoTrace.Write($"gpu-surface-visibility changed from={previousVisible} to={visible}");
+            TraceGpuState("gpu-surface-visibility", previousVisible != visible);
+        }
+
+        private void TraceGpuState(string reason, bool force = false)
+        {
+            if (!RtspVideoTrace.Enabled)
+                return;
+
+            try
+            {
+                bool surfaceHandleCreated = _gpuSurface != null && _gpuSurface.IsHandleCreated;
+                string surfaceHandle = surfaceHandleCreated
+                    ? $"0x{_gpuSurface.Handle.ToInt64():X}"
+                    : "0x0";
+                string state = $"playing={IsPlaying} draw={DrawImage} requestedPipeline={_pipelineMode} effectivePipeline={_effectivePipelineMode} noVideo={IsNoVideoActive} gpuReady={Volatile.Read(ref _gpuSurfaceReady) != 0} endToEndGpu={IsEndToEndGpuActive} surfaceVisible={_gpuSurface?.Visible ?? false} surfaceCreated={surfaceHandleCreated} surfaceHandle={surfaceHandle} client={ClientSize} surfaceBounds={(_gpuSurface == null ? Rectangle.Empty.ToString() : _gpuSurface.Bounds.ToString())}";
+                string previousState = Interlocked.Exchange(ref _diagnosticLastState, state);
+                bool changed = !string.Equals(previousState, state, StringComparison.Ordinal);
+                long now = Stopwatch.GetTimestamp();
+                long last = Interlocked.Read(ref _diagnosticLastStateTimestamp);
+                if (!force && !changed && last != 0 && now - last < Stopwatch.Frequency)
+                    return;
+
+                Interlocked.Exchange(ref _diagnosticLastStateTimestamp, now);
+                RtspVideoTrace.Write($"state reason={reason} {state} received={ReceivedVideoFrameCount} decoded={NativeDecodedFrameCount} gpu={GpuRenderedFrameCount} skipped={GpuSkippedFrameCount} failures={DecodeFailureCount} status={SanitizeDiagnosticText(LastStatus)} decoder={SanitizeDiagnosticText(LastDecoderStatus)}");
+            }
+            catch (Exception exception)
+            {
+                RtspVideoTrace.Write($"state-error reason={reason} message={SanitizeDiagnosticText(exception.Message)}");
+            }
+        }
+
+        private static string SanitizeDiagnosticText(string value)
+        {
+            if (string.IsNullOrEmpty(value))
+                return "-";
+
+            return value.Replace('\r', ' ').Replace('\n', ' ');
         }
 
         private sealed class GpuVideoSurfaceControl : Control

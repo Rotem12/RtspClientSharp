@@ -39,8 +39,10 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
-            if (ArrayUtils.StartsWith(byteSegment.Array, byteSegment.Offset, byteSegment.Count,
-                RawH265Frame.StartMarker))
+            if (byteSegment.Array == null || byteSegment.Count < 2)
+                return;
+
+            if (H265Slicer.StartsWithStartMarker(byteSegment))
                 H265Slicer.Slice(byteSegment, SliceOnNalUnitFound);
             else
                 ProcessNalUnit(byteSegment, false, ref generateFrame);
@@ -121,9 +123,21 @@ namespace RtspClientSharp.MediaParsers
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
             int offset = byteSegment.Offset;
+            int startMarkerLength = hasStartMarker
+                ? H265Slicer.GetStartMarkerLength(byteSegment.Array, byteSegment.Offset,
+                    byteSegment.Offset + byteSegment.Count)
+                : 0;
 
             if (hasStartMarker)
-                offset += RawH265Frame.StartMarkerSize;
+            {
+                if (startMarkerLength == 0)
+                    return;
+
+                offset += startMarkerLength;
+            }
+
+            if (offset < byteSegment.Offset || offset + 2 > byteSegment.Offset + byteSegment.Count)
+                return;
 
             /*
          *  +---------------+---------------+
@@ -139,7 +153,7 @@ namespace RtspClientSharp.MediaParsers
         */
 
             // forbidden_zero_bit must be 0
-            if (!(byteSegment.Array[offset] >> 0x0F == 0))
+            if ((byteSegment.Array[offset] & 0x80) != 0)
                 throw new H265ParserException("Forbidden zero bit's different than zero.");
 
             int nalUnitType = (byteSegment.Array[offset] >> 1) & 0x3F;
@@ -162,25 +176,25 @@ namespace RtspClientSharp.MediaParsers
             {
                 /* Video parameter set */
                 case RtpH265NALUType.VPS_NUT:
-                    ProcessParameters(byteSegment, hasStartMarker, 0, _vpsMap);
+                    ProcessParameters(byteSegment, startMarkerLength, 0, _vpsMap);
                     return;
                 /* Sequence parameter set */
                 case RtpH265NALUType.SPS_NUT:
-                    ProcessParameters(byteSegment, hasStartMarker, 0, _spsMap);
+                    ProcessParameters(byteSegment, startMarkerLength, 0, _spsMap);
                     return;
                 /* Picture parameter set */
                 case RtpH265NALUType.PPS_NUT:
-                    ProcessParameters(byteSegment, hasStartMarker, 0, _ppsMap);
+                    ProcessParameters(byteSegment, startMarkerLength, 0, _ppsMap);
                     return;
                 /* Supplemental enhancement information (SEI)*/
                 case RtpH265NALUType.PREFIX_SEI_NUT:
-                    ProcessParameters(byteSegment, hasStartMarker, 0, _seiMap);
+                    ProcessParameters(byteSegment, startMarkerLength, 0, _seiMap);
                     return;
                 default:
                     break;
             }
 
-            if (_sliceType == -1 && ((RtpH265NALUType)nalUnitType == RtpH265NALUType.TRAIL_R || (RtpH265NALUType)nalUnitType == RtpH265NALUType.IDR_W_RADL))
+            if (_sliceType == -1 && RtpH265TypeUtils.IsVideoCodingLayerNalUnit(nalUnitType))
                 _sliceType = nalUnitType;
 
             if (generateFrame && (hasStartMarker || byteSegment.Offset >= StartMarkSegment.Count) && _frameStream.Position == 0)
@@ -207,20 +221,22 @@ namespace RtspClientSharp.MediaParsers
             }
         }
 
-        private void ProcessParameters(ArraySegment<byte> byteSegment, bool hasStartMarker, int offset,
+        private void ProcessParameters(ArraySegment<byte> byteSegment, int startMarkerLength, int offset,
             Dictionary<int, byte[]> idToBytesMap)
         {
-            _bitStreamReader.ReInitialize(hasStartMarker
-                ? byteSegment.SubSegment(RawH265Frame.StartMarkerSize + offset)
-                : byteSegment.SubSegment(offset));
+            int rbspOffset = startMarkerLength + RtpH265TypeUtils.RtpHevcNaluHeaderSize + offset;
+            if (rbspOffset >= byteSegment.Count)
+                return;
+
+            _bitStreamReader.ReInitialize(byteSegment.SubSegment(rbspOffset));
 
             int id = _bitStreamReader.ReadUe();
 
             if (id == -1)
                 return;
 
-            if (hasStartMarker)
-                byteSegment = byteSegment.SubSegment(RawH265Frame.StartMarkerSize);
+            if (startMarkerLength != 0)
+                byteSegment = byteSegment.SubSegment(startMarkerLength);
 
             if (TryUpdateParameters(byteSegment, id, idToBytesMap))
                 _updatedParametersBytes = true;
@@ -284,9 +300,9 @@ namespace RtspClientSharp.MediaParsers
 
         private static HevcFrameType GetFrameTypeFromNal(RtpH265NALUType nalType)
         {
-            if (nalType == RtpH265NALUType.IDR_W_RADL)
+            if (RtpH265TypeUtils.IsIntraFrameNalUnit((int)nalType))
                 return HevcFrameType.IntraFrame;
-            if (nalType == RtpH265NALUType.TRAIL_R)
+            if (RtpH265TypeUtils.IsVideoCodingLayerNalUnit((int)nalType))
                 return HevcFrameType.PredictionFrame;
 
             return HevcFrameType.Unknown;

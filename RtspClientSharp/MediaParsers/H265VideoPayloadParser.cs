@@ -35,6 +35,12 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
 
+            if (byteSegment.Array == null || byteSegment.Count < RtpH265TypeUtils.RtpHevcPayloadHeaderSize)
+            {
+                ResetState();
+                return;
+            }
+
             if (!markerBit && timeOffset != _timeOffset)
                 _h265Parser.TryGetFrameBytes();
 
@@ -66,6 +72,7 @@ namespace RtspClientSharp.MediaParsers
         public override void ResetState()
         {
             _nalStream.Position = 0;
+            _nalStream.SetLength(0);
             _h265Parser.ResetState();
             _waitForStartFu = true;
         }
@@ -101,48 +108,44 @@ namespace RtspClientSharp.MediaParsers
 
             /* pass the HEVC payload header */
             int offset = byteSegment.Offset + RtpH265TypeUtils.RtpHevcPayloadHeaderSize;
+            int endOffset = byteSegment.Offset + byteSegment.Count;
 
             /* pass the HEVC DONL field */
             if (_usingDonlField)
                 offset += RtpH265TypeUtils.RtpHevcDonlFieldSize;
 
-            while (offset < byteSegment.Count)
+            while (offset < endOffset)
             {
-                int nalUnitSize = BigEndianConverter.ReadUInt16(byteSegment.Array, byteSegment.Offset);
+                if (endOffset - offset < RtpH265TypeUtils.RtpHevcApNaluLengthFieldSize)
+                {
+                    ResetState();
+                    return;
+                }
+
+                int nalUnitSize = BigEndianConverter.ReadUInt16(byteSegment.Array, offset);
 
                 // consume the length of the aggregate
                 offset += RtpH265TypeUtils.RtpHevcApNaluLengthFieldSize;
 
-                if (nalUnitSize <= 0 || nalUnitSize > (byteSegment.Count - offset))
+                if (nalUnitSize < RtpH265TypeUtils.RtpHevcNaluHeaderSize || nalUnitSize > endOffset - offset)
+                {
+                    ResetState();
                     return;
+                }
 
-                int nalUnitHeader = BigEndianConverter.ReadUInt16(byteSegment.Array, byteSegment.Offset);
-                offset += RtpH265TypeUtils.RtpHevcNaluHeaderSize;
-
-                // TODO: make a function out of this block (IsValidNaluHeader)
-                bool output = nalUnitHeader >> 15 == 0;
-                if (!output)
+                if (!TryValidateNalHeader(byteSegment.Array, offset, endOffset, out int nalUnitType) ||
+                    nalUnitType >= (int)RtpH265NALUType.RTPHEVC_AP)
+                {
+                    ResetState();
                     return;
+                }
 
-                output = (nalUnitHeader & 0x1F8) >> 3 == 0;
+                bool lastNalUnit = offset + nalUnitSize == endOffset;
+                var newByteSegment = new ArraySegment<byte>(byteSegment.Array, offset, nalUnitSize);
 
-                if (!output)
-                    return;
+                _h265Parser.Parse(newByteSegment, markerBit && lastNalUnit);
 
-                output = (nalUnitHeader & 3) > 0;
-
-                if (!output)
-                    return;
-
-                if (!RtpH265TypeUtils.CheckIfIsValid(nalUnitHeader))
-                    throw new H265ParserException($"Invalid AP Nal unit type { nalUnitHeader }");
-
-                // Maybe validate if it is VCL or non-VCL
-                var newByteSegment = new ArraySegment<byte>(byteSegment.Array, offset, byteSegment.Offset + byteSegment.Count - offset);
-
-                _h265Parser.Parse(newByteSegment, true);
-
-                offset += nalUnitSize - RtpH265TypeUtils.RtpHevcNaluHeaderSize;
+                offset += nalUnitSize;
             }
         }
 
@@ -150,6 +153,13 @@ namespace RtspClientSharp.MediaParsers
         {
             Debug.WriteLine("Fragmentation Unit");
             Debug.Assert(byteSegment.Array != null, "byteSegment.Array != null");
+
+            if (byteSegment.Array == null || byteSegment.Count <
+                RtpH265TypeUtils.RtpHevcPayloadHeaderSize + RtpH265TypeUtils.RtpHevcFuHeaderSize)
+            {
+                ResetState();
+                return;
+            }
 
             /*
             *    decode the FU header
@@ -171,9 +181,11 @@ namespace RtspClientSharp.MediaParsers
             bool startMarker = (fuHeader & 0x80) != 0;
             bool endMarker = (fuHeader & 0x40) != 0;
 
-            // Start bit and End bit must not both be set to 1 in the same FU header
-            if (startMarker && endMarker)
-                throw new H265ParserException($"Illegal combination of S and E bit in RTP/HEVC packet");
+            if (fuType > 47)
+            {
+                ResetState();
+                return;
+            }
 
             // Pass the HEVC FU header
             offset += RtpH265TypeUtils.RtpHevcFuHeaderSize;
@@ -191,11 +203,19 @@ namespace RtspClientSharp.MediaParsers
                 newNalHeader[0] = Convert.ToByte((byteSegment.Array[byteSegment.Offset] & 0x81) | (fuType << 1));
                 newNalHeader[1] = byteSegment.Array[byteSegment.Offset + 1];
 
-                var nalUnitSegment = new ArraySegment<byte>(byteSegment.Array, offset, byteSegment.Offset + byteSegment.Count - offset);
+                if (offset > byteSegment.Offset + byteSegment.Count)
+                {
+                    ResetState();
+                    return;
+                }
 
-                if (!ArrayUtils.StartsWith(nalUnitSegment.Array, nalUnitSegment.Offset, nalUnitSegment.Count,
-                    RawH265Frame.StartMarker))
-                    _nalStream.Write(H265Parser.StartMarkSegment.Array, H265Parser.StartMarkSegment.Offset, H265Parser.StartMarkSegment.Count);
+                var nalUnitSegment = new ArraySegment<byte>(byteSegment.Array, offset,
+                    byteSegment.Offset + byteSegment.Count - offset);
+
+                _nalStream.Position = 0;
+                _nalStream.SetLength(0);
+                _nalStream.Write(H265Parser.StartMarkSegment.Array, H265Parser.StartMarkSegment.Offset,
+                    H265Parser.StartMarkSegment.Count);
 
                 _nalStream.WriteByte(newNalHeader[0]);
                 _nalStream.WriteByte(newNalHeader[1]);
@@ -204,23 +224,58 @@ namespace RtspClientSharp.MediaParsers
 
                 _waitForStartFu = false;
 
+                if (endMarker)
+                    CompleteFragmentedNal(markerBit);
+
                 return;
             }
 
             if (_waitForStartFu)
                 return;
 
-            _nalStream.Write(byteSegment.Array, offset, byteSegment.Offset + byteSegment.Count - offset);
+            int payloadLength = byteSegment.Offset + byteSegment.Count - offset;
+            if (payloadLength > 0)
+                _nalStream.Write(byteSegment.Array, offset, payloadLength);
 
             if (endMarker)
             {
-                // End part of Fragment               
-                RawVideoFramePadding.Ensure(_nalStream);
-                var nalUnitSegment = new ArraySegment<byte>(_nalStream.GetBuffer(), 0, (int)_nalStream.Position);
-                _nalStream.Position = 0;
-                _h265Parser.Parse(nalUnitSegment, markerBit);
-                _waitForStartFu = true;
+                CompleteFragmentedNal(markerBit);
             }
+        }
+
+        private void CompleteFragmentedNal(bool markerBit)
+        {
+            if (_nalStream.Position <= RawH265Frame.StartMarkerSize + RtpH265TypeUtils.RtpHevcNaluHeaderSize)
+            {
+                ResetState();
+                return;
+            }
+
+            RawVideoFramePadding.Ensure(_nalStream);
+            var nalUnitSegment = new ArraySegment<byte>(_nalStream.GetBuffer(), 0, (int)_nalStream.Position);
+            _nalStream.Position = 0;
+            _h265Parser.Parse(nalUnitSegment, markerBit);
+            _waitForStartFu = true;
+        }
+
+        private static bool TryValidateNalHeader(byte[] buffer, int offset, int endOffset,
+            out int nalUnitType)
+        {
+            nalUnitType = 0;
+            if (offset < 0 || offset + RtpH265TypeUtils.RtpHevcNaluHeaderSize > endOffset)
+                return false;
+
+            byte first = buffer[offset];
+            byte second = buffer[offset + 1];
+            if ((first & 0x80) != 0)
+                return false;
+
+            int layerId = ((first & 0x01) << 5) | ((second >> 3) & 0x1F);
+            if (layerId != 0 || (second & 0x07) == 0)
+                return false;
+
+            nalUnitType = (first >> 1) & 0x3F;
+            return nalUnitType <= 47;
         }
     }
 }

@@ -51,6 +51,21 @@ namespace RtspClientSharp.UnitTests.Rtp
         }
 
         [TestMethod]
+        public void Process_AutoModeWithDamagedRtpHeader_SelectsRtpStream()
+        {
+            var selected = new CapturingStream();
+            var autoStream = new AutoDetectingTransportStream(MediaTransportMode.Auto,
+                () => selected,
+                () => throw new AssertFailedException("MPEG-TS stream should not be selected"));
+
+            byte[] payload = {0x80, 0x60};
+            autoStream.Process(new ArraySegment<byte>(payload));
+
+            Assert.AreEqual(MediaTransportMode.Rtp, autoStream.DetectedMode);
+            Assert.AreEqual(1, selected.ProcessCount);
+        }
+
+        [TestMethod]
         public void Process_ExplicitModeSelectsConfiguredStreamBeforeSniffing()
         {
             var selected = new CapturingStream();

@@ -2,7 +2,9 @@ using System;
 using System.Security.Authentication;
 using System.Threading;
 using System.Threading.Tasks;
+using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.RawFrames;
+using RtspClientSharp.RawFrames.Video;
 using RtspClientSharp.Rtsp;
 using DirectRtpClient = RtspClientSharp.RtpClient.RtpClient;
 
@@ -15,6 +17,7 @@ namespace RtspClientSharp.WinForms
         event EventHandler<string> StatusChanged;
 
         MediaTransportMode DetectedTransportMode { get; }
+        CodecInfoType DetectedVideoCodec { get; }
         long TransportDatagramCount { get; }
         long TransportFrameCount { get; }
         long TransportDroppedFrameCount { get; }
@@ -30,6 +33,7 @@ namespace RtspClientSharp.WinForms
         event EventHandler<RawFrame> FrameReceived;
 
         MediaTransportMode DetectedTransportMode { get; }
+        CodecInfoType DetectedVideoCodec { get; }
         long TransportDatagramCount { get; }
         long TransportFrameCount { get; }
         long TransportDroppedFrameCount { get; }
@@ -48,6 +52,7 @@ namespace RtspClientSharp.WinForms
         private CancellationTokenSource _cancellationTokenSource;
         private Task _workTask = Task.CompletedTask;
         private int _detectedTransportMode = (int)MediaTransportMode.Auto;
+        private int _detectedVideoCodec = (int)CodecInfoType.Auto;
         private long _transportDatagramCount;
         private long _transportFrameCount;
         private long _transportDroppedFrameCount;
@@ -65,6 +70,8 @@ namespace RtspClientSharp.WinForms
         public event EventHandler<string> StatusChanged;
         public MediaTransportMode DetectedTransportMode =>
             (MediaTransportMode)Volatile.Read(ref _detectedTransportMode);
+        public CodecInfoType DetectedVideoCodec =>
+            (CodecInfoType)Volatile.Read(ref _detectedVideoCodec);
         public long TransportDatagramCount
         {
             get
@@ -125,6 +132,8 @@ namespace RtspClientSharp.WinForms
                 if (_disposed)
                     throw new ObjectDisposedException(nameof(RawFrameSource));
 
+                Volatile.Write(ref _detectedTransportMode, (int)MediaTransportMode.Auto);
+                Volatile.Write(ref _detectedVideoCodec, (int)CodecInfoType.Auto);
                 _cancellationTokenSource = new CancellationTokenSource();
                 CancellationToken token = _cancellationTokenSource.Token;
                 _workTask = Task.Run(() => ReceiveLoopAsync(token), token);
@@ -193,6 +202,7 @@ namespace RtspClientSharp.WinForms
                             OnStatusChanged("Connecting...");
                             await client.ConnectAsync(token).ConfigureAwait(false);
                             Volatile.Write(ref _detectedTransportMode, (int)client.DetectedTransportMode);
+                            UpdateDetectedVideoCodec(client, null);
                             UpdateTransportMetrics(client);
                             OnStatusChanged("Receiving frames...");
 
@@ -254,6 +264,7 @@ namespace RtspClientSharp.WinForms
             {
                 UpdateDetectedTransportMode(client);
             }
+            UpdateDetectedVideoCodec(sender as IRawFrameClient, rawFrame);
             FrameReceived?.Invoke(this, rawFrame);
         }
 
@@ -263,7 +274,25 @@ namespace RtspClientSharp.WinForms
                 sender is IRawFrameClient client)
                 UpdateDetectedTransportMode(client);
 
+            UpdateDetectedVideoCodec(sender as IRawFrameClient, rawFrame);
             RawFrameGenerated?.Invoke(this, rawFrame);
+        }
+
+        private void UpdateDetectedVideoCodec(IRawFrameClient client, RawFrame rawFrame)
+        {
+            CodecInfoType codec = client?.DetectedVideoCodec ?? CodecInfoType.Auto;
+            if (codec == CodecInfoType.Auto)
+            {
+                if (rawFrame is RawH264Frame)
+                    codec = CodecInfoType.H264;
+                else if (rawFrame is RawH265Frame)
+                    codec = CodecInfoType.H265;
+                else if (rawFrame is RawJpegFrame)
+                    codec = CodecInfoType.MJPEG;
+            }
+
+            if (codec != CodecInfoType.Auto)
+                Volatile.Write(ref _detectedVideoCodec, (int)codec);
         }
 
         private void UpdateDetectedTransportMode(IRawFrameClient client)
@@ -312,6 +341,7 @@ namespace RtspClientSharp.WinForms
         public event EventHandler<RawFrame> RawFrameGenerated;
         public event EventHandler<RawFrame> FrameReceived;
         public MediaTransportMode DetectedTransportMode => MediaTransportMode.Auto;
+        public CodecInfoType DetectedVideoCodec => CodecInfoType.Auto;
         public long TransportDatagramCount => 0;
         public long TransportFrameCount => 0;
         public long TransportDroppedFrameCount => 0;
@@ -356,13 +386,14 @@ namespace RtspClientSharp.WinForms
         private readonly DirectRtpClient _client;
         private bool _rawFrameForwarding;
 
-        public DirectUdpRawFrameClient(ConnectionParameters connectionParameters, bool isH264,
-            byte[] h264SpsPpsBytes)
+        public DirectUdpRawFrameClient(ConnectionParameters connectionParameters, CodecInfoType videoCodec,
+            byte[] h264SpsPpsBytes, byte[] h265VpsSpsPpsBytes)
         {
             _client = new DirectRtpClient(connectionParameters)
             {
-                IsH264 = isH264,
+                VideoCodec = videoCodec,
                 H264SpsPpsBytes = h264SpsPpsBytes ?? Array.Empty<byte>(),
+                H265VpsSpsPpsBytes = h265VpsSpsPpsBytes ?? Array.Empty<byte>(),
                 UseInlineFrameDelivery = true
             };
             _client.FrameReceived += ClientOnFrameReceived;
@@ -371,6 +402,7 @@ namespace RtspClientSharp.WinForms
         public event EventHandler<RawFrame> RawFrameGenerated;
         public event EventHandler<RawFrame> FrameReceived;
         public MediaTransportMode DetectedTransportMode => _client.DetectedTransportMode;
+        public CodecInfoType DetectedVideoCodec => _client.DetectedVideoCodec;
         public long TransportDatagramCount => _client.ReceivedDatagramCount;
         public long TransportFrameCount => _client.GeneratedFrameCount;
         public long TransportDroppedFrameCount => _client.DispatcherDroppedFrameCount;

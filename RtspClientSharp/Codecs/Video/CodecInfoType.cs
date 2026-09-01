@@ -8,6 +8,8 @@ namespace RtspClientSharp.Codecs.Video
     {
         H264,
         H265,
-        MJPEG
+        MJPEG,
+        /// <summary>Detect the video codec from the media stream.</summary>
+        Auto
     }
 }

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using RtspClientSharp.Codecs.Video;
 using RtspClientSharp.MediaParsers;
 using RtspClientSharp.RawFrames;
 using RtspClientSharp.RawFrames.Audio;
@@ -76,6 +77,45 @@ namespace RtspClientSharp.UnitTests.Ts
             var aacFrame = (RawAACFrame)frames[0];
             Assert.IsTrue(aacFrame.FrameSegment.SequenceEqual(new byte[] { 0x11, 0x22 }));
             Assert.IsTrue(aacFrame.ConfigSegment.SequenceEqual(new byte[] { 0x12, 0x10 }));
+        }
+
+        [TestMethod]
+        public void Process_MjpegTransportStream_GeneratesJpegFrame()
+        {
+            var frames = new List<RawFrame>();
+            var stream = new TsStream(new CapturingParser { FrameGenerated = frames.Add });
+            byte[] jpeg = { 0x00, 0x11, 0xFF, 0xD8, 0x22, 0x33, 0xFF, 0xD9, 0x44 };
+            byte[][] packets = BuildProgramPackets(0x06, 0x0101, 0xBD, jpeg);
+
+            foreach (byte[] packet in packets)
+                stream.Process(new ArraySegment<byte>(packet));
+
+            Assert.AreEqual(1, frames.Count);
+            Assert.IsInstanceOfType(frames[0], typeof(RawJpegFrame));
+            Assert.IsTrue(frames[0].FrameSegment.SequenceEqual(new byte[]
+                {0xFF, 0xD8, 0x22, 0x33, 0xFF, 0xD9}));
+        }
+
+        [TestMethod]
+        public void Process_H265TransportStream_GeneratesVideoFrame()
+        {
+            var frames = new List<RawFrame>();
+            var stream = new TsStream(new CapturingParser { FrameGenerated = frames.Add });
+            byte[] accessUnit =
+            {
+                0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x80,
+                0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x80,
+                0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0x80,
+                0x00, 0x00, 0x00, 0x01, 0x26, 0x01, 0x80
+            };
+            byte[][] packets = BuildProgramPackets(0x24, 0x0101, 0xE0, accessUnit);
+
+            foreach (byte[] packet in packets)
+                stream.Process(new ArraySegment<byte>(packet));
+
+            Assert.AreEqual(CodecInfoType.H265, stream.DetectedVideoCodec);
+            Assert.AreEqual(1, frames.Count);
+            Assert.IsInstanceOfType(frames[0], typeof(RawH265IFrame));
         }
 
         private static byte[][] BuildProgramPackets(byte streamType, ushort elementaryPid, byte streamId, byte[] elementaryData)

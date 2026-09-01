@@ -1,10 +1,12 @@
 using System;
 using System.Collections.Generic;
+using RtspClientSharp.Codecs.Video;
+using RtspClientSharp.MediaParsers;
 using RtspClientSharp.Ts;
 
 namespace RtspClientSharp.Rtp
 {
-    sealed class AutoDetectingTransportStream : ITransportStream
+    sealed class AutoDetectingTransportStream : ITransportStream, IVideoCodecDetector
     {
         private readonly Func<ITransportStream> _rtpStreamFactory;
         private readonly Func<ITransportStream> _mpegTsStreamFactory;
@@ -14,6 +16,8 @@ namespace RtspClientSharp.Rtp
         private ITransportStream _selectedStream;
 
         public MediaTransportMode DetectedMode { get; private set; } = MediaTransportMode.Auto;
+        public CodecInfoType DetectedVideoCodec =>
+            (_selectedStream as IVideoCodecDetector)?.DetectedVideoCodec ?? CodecInfoType.Auto;
 
         public AutoDetectingTransportStream(MediaTransportMode configuredMode,
             Func<ITransportStream> rtpStreamFactory, Func<ITransportStream> mpegTsStreamFactory)
@@ -45,6 +49,17 @@ namespace RtspClientSharp.Rtp
             // A complete RTP datagram can be selected immediately. This check comes before
             // buffering because RTP packets are datagram-delimited, unlike raw MPEG-TS data.
             if (RtpPacket.TryParse(payloadSegment, out _))
+            {
+                SelectStream(MediaTransportMode.Rtp);
+                _selectedStream.Process(payloadSegment);
+                return;
+            }
+
+            // A damaged first RTP datagram must not permanently steer the
+            // session away from RTP. Version 2 is not used by MPEG-TS (whose
+            // sync byte is 0x47), so it is safe to lock onto RTP and let the
+            // RtpStream discard this particular malformed packet.
+            if (LooksLikeRtpHeader(payloadSegment))
             {
                 SelectStream(MediaTransportMode.Rtp);
                 _selectedStream.Process(payloadSegment);
@@ -113,6 +128,12 @@ namespace RtspClientSharp.Rtp
             }
 
             return true;
+        }
+
+        private static bool LooksLikeRtpHeader(ArraySegment<byte> payloadSegment)
+        {
+            return payloadSegment.Array != null && payloadSegment.Count >= 2 &&
+                   (payloadSegment.Array[payloadSegment.Offset] >> 6) == RtpPacket.RtpProtocolVersion;
         }
     }
 }
